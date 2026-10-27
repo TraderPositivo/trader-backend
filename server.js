@@ -82,17 +82,16 @@ app.post('/api/auth', wrap(async (req, res) => {
 
 // ── migrate: novas colunas de capital/risco ────────────────────────────────
 async function migrateContas(sql) {
-  for (const col of [
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS capital_disponivel DECIMAL(12,2) DEFAULT 0",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS risco_pct DECIMAL(5,2) DEFAULT 1.0",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS instrumento VARCHAR(10) DEFAULT 'WIN'",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS tipo_conta VARCHAR(20) DEFAULT 'pessoal'",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_win INT DEFAULT 200",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_wdo INT DEFAULT 100",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos INT DEFAULT 1",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos_wdo INT DEFAULT 1",
-    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS max_operacoes_dia INT DEFAULT 10",
-  ]) { try { await sql.unsafe(col) } catch(_) {} }
+  const run = async (q) => { try { await sql(q) } catch(_) {} }
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS capital_disponivel DECIMAL(12,2) DEFAULT 0`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS risco_pct DECIMAL(5,2) DEFAULT 1.0`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS instrumento VARCHAR(10) DEFAULT 'WIN'`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS tipo_conta VARCHAR(20) DEFAULT 'pessoal'`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_win INT DEFAULT 200`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_wdo INT DEFAULT 100`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos INT DEFAULT 1`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos_wdo INT DEFAULT 1`])
+  await run([`ALTER TABLE contas ADD COLUMN IF NOT EXISTS max_operacoes_dia INT DEFAULT 10`])
 }
 
 // ── /api/contas ────────────────────────────────────────────────────────────
