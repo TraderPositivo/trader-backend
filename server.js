@@ -80,10 +80,26 @@ app.post('/api/auth', wrap(async (req, res) => {
   throw new Error('Ação inválida')
 }))
 
+// ── migrate: novas colunas de capital/risco ────────────────────────────────
+async function migrateContas(sql) {
+  for (const col of [
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS capital_disponivel DECIMAL(12,2) DEFAULT 0",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS risco_pct DECIMAL(5,2) DEFAULT 1.0",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS instrumento VARCHAR(10) DEFAULT 'WIN'",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS tipo_conta VARCHAR(20) DEFAULT 'pessoal'",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_win INT DEFAULT 200",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS stop_pts_wdo INT DEFAULT 100",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos INT DEFAULT 1",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS contratos_wdo INT DEFAULT 1",
+    "ALTER TABLE contas ADD COLUMN IF NOT EXISTS max_operacoes_dia INT DEFAULT 10",
+  ]) { try { await sql.unsafe(col) } catch(_) {} }
+}
+
 // ── /api/contas ────────────────────────────────────────────────────────────
 app.get('/api/contas', wrap(async (req, res) => {
   const user = verifyToken(req)
   const sql  = db()
+  await migrateContas(sql)
   const rows = await sql`SELECT * FROM contas WHERE usuario_id = ${user.id} ORDER BY nome`
   res.json(rows)
 }))
@@ -91,29 +107,39 @@ app.get('/api/contas', wrap(async (req, res) => {
 app.post('/api/contas', wrap(async (req, res) => {
   const user = verifyToken(req)
   const sql  = db()
+  await migrateContas(sql)
   const body = req.body || {}
 
   if (body.action === 'salvar') {
-    const { id, nome, meta_diaria, stop_diario, meta_mensal, stop_mensal, operar_ativo,
-            loss_limit_ciclo, custo_renovacao } = body
+    const { id, nome, meta_diaria, stop_diario, meta_mensal, stop_mensal,
+            loss_limit_ciclo, custo_renovacao,
+            capital_disponivel, risco_pct, instrumento, tipo_conta,
+            stop_pts_win, stop_pts_wdo } = body
     if (!nome?.trim()) throw new Error('Nome é obrigatório')
     if (id) {
       await sql`
         UPDATE contas SET
-          nome = ${nome}, meta_diaria = ${meta_diaria || 0}, stop_diario = ${stop_diario || 0},
+          nome = ${nome},
+          meta_diaria = ${meta_diaria || 0}, stop_diario = ${stop_diario || 0},
           meta_mensal = ${meta_mensal || 0}, stop_mensal = ${stop_mensal || 0},
-          operar_ativo = ${operar_ativo ? 1 : 0},
-          loss_limit_ciclo = ${loss_limit_ciclo || 0}, custo_renovacao = ${custo_renovacao || 0}
+          loss_limit_ciclo = ${loss_limit_ciclo || 0}, custo_renovacao = ${custo_renovacao || 0},
+          capital_disponivel = ${capital_disponivel || 0}, risco_pct = ${risco_pct || 1},
+          instrumento = ${instrumento || 'WIN'}, tipo_conta = ${tipo_conta || 'pessoal'},
+          stop_pts_win = ${stop_pts_win || 200}, stop_pts_wdo = ${stop_pts_wdo || 100}
         WHERE id = ${id} AND usuario_id = ${user.id}
       `
       return res.json({ ok: true, id })
     } else {
       const [row] = await sql`
         INSERT INTO contas (usuario_id, nome, meta_diaria, stop_diario, meta_mensal, stop_mensal,
-          operar_ativo, loss_limit_ciclo, custo_renovacao)
+          loss_limit_ciclo, custo_renovacao, capital_disponivel, risco_pct,
+          instrumento, tipo_conta, stop_pts_win, stop_pts_wdo)
         VALUES (${user.id}, ${nome}, ${meta_diaria || 0}, ${stop_diario || 0},
-          ${meta_mensal || 0}, ${stop_mensal || 0}, ${operar_ativo ? 1 : 0},
-          ${loss_limit_ciclo || 0}, ${custo_renovacao || 0})
+          ${meta_mensal || 0}, ${stop_mensal || 0},
+          ${loss_limit_ciclo || 0}, ${custo_renovacao || 0},
+          ${capital_disponivel || 0}, ${risco_pct || 1},
+          ${instrumento || 'WIN'}, ${tipo_conta || 'pessoal'},
+          ${stop_pts_win || 200}, ${stop_pts_wdo || 100})
         RETURNING id
       `
       return res.json({ ok: true, id: row.id })
