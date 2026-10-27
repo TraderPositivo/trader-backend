@@ -38,6 +38,44 @@ function verifyToken(req) {
   return jwt.verify(token, JWT_SECRET)
 }
 
+// ── acesso por plano ───────────────────────────────────────────────────────
+// Cada aluno tem um plano e uma data "acesso_ate". Passou da data, o sistema
+// bloqueia (admin nunca é bloqueado). Na primeira execução, quem já existe
+// ganha 30 dias para ninguém perder o acesso na virada.
+let acessoSchemaOk = false
+async function ensureAcessoSchema(sql) {
+  if (acessoSchemaOk) return
+  const [col] = await sql`SELECT 1 AS ok FROM information_schema.columns WHERE table_name = 'usuarios' AND column_name = 'acesso_ate'`
+  if (!col) {
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS plano VARCHAR(20) DEFAULT 'sala'`
+    await sql`ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS acesso_ate DATE`
+    await sql`UPDATE usuarios SET plano = COALESCE(plano, 'sala'), acesso_ate = (now() AT TIME ZONE 'America/Sao_Paulo')::date + 30 WHERE acesso_ate IS NULL`
+  }
+  acessoSchemaOk = true
+}
+
+async function lerAcesso(sql, id) {
+  await ensureAcessoSchema(sql)
+  const [u] = await sql`
+    SELECT id, nome, email, role, ativo, plano, to_char(acesso_ate, 'YYYY-MM-DD') AS acesso_ate,
+           (role = 'admin' OR COALESCE(acesso_ate >= (now() AT TIME ZONE 'America/Sao_Paulo')::date, false)) AS acesso_liberado
+    FROM usuarios WHERE id = ${id}`
+  return u
+}
+
+function publico(u) {
+  return { id: u.id, nome: u.nome, email: u.email, role: u.role, plano: u.plano, acesso_ate: u.acesso_ate, acesso_liberado: !!u.acesso_liberado }
+}
+
+// Rotas do TraderSystem: exige login E acesso em dia
+async function exigirAcesso(req, sql) {
+  const decoded = verifyToken(req)
+  const u = await lerAcesso(sql, decoded.id)
+  if (!u || u.ativo != 1) throw Object.assign(new Error('Usuário inativo'), { status: 401 })
+  if (!u.acesso_liberado) throw Object.assign(new Error('Seu acesso ao TraderSystem venceu. Renove o plano para continuar.'), { status: 403, codigo: 'ACESSO_VENCIDO' })
+  return decoded
+}
+
 // ── app ────────────────────────────────────────────────────────────────────
 const app = express()
 app.use(cors())
@@ -48,7 +86,7 @@ function wrap(fn) {
     try {
       await fn(req, res)
     } catch (err) {
-      res.status(err.status || 500).json({ erro: err.message })
+      res.status(err.status || 500).json({ erro: err.message, ...(err.codigo ? { codigo: err.codigo } : {}) })
     }
   }
 }
@@ -67,14 +105,14 @@ app.post('/api/auth', wrap(async (req, res) => {
       throw Object.assign(new Error('E-mail ou senha incorretos'), { status: 401 })
     }
     const token = signToken({ id: user.id, role: user.role })
-    return res.json({ token, usuario: { id: user.id, nome: user.nome, email: user.email, role: user.role } })
+    return res.json({ token, usuario: publico(await lerAcesso(sql, user.id)) })
   }
 
   if (body.action === 'me') {
     const decoded = verifyToken(req)
-    const rows = await sql`SELECT id, nome, email, role FROM usuarios WHERE id = ${decoded.id}`
-    if (!rows[0]) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 })
-    return res.json(rows[0])
+    const u = await lerAcesso(sql, decoded.id)
+    if (!u) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 })
+    return res.json(publico(u))
   }
 
   throw new Error('Ação inválida')
@@ -96,16 +134,16 @@ async function migrateContas(sql) {
 
 // ── /api/contas ────────────────────────────────────────────────────────────
 app.get('/api/contas', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   await migrateContas(sql)
   const rows = await sql`SELECT * FROM contas WHERE usuario_id = ${user.id} ORDER BY nome`
   res.json(rows)
 }))
 
 app.post('/api/contas', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   await migrateContas(sql)
   const body = req.body || {}
 
@@ -166,8 +204,8 @@ app.post('/api/contas', wrap(async (req, res) => {
 
 // ── /api/dashboard ─────────────────────────────────────────────────────────
 app.get('/api/dashboard', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   const hoje = new Date().toISOString().slice(0, 10)
 
   const contas = await sql`SELECT * FROM contas WHERE usuario_id = ${user.id} AND ativa = 1 ORDER BY nome`
@@ -254,8 +292,8 @@ app.get('/api/dashboard', wrap(async (req, res) => {
 
 // ── /api/operacoes ─────────────────────────────────────────────────────────
 app.get('/api/operacoes', wrap(async (req, res) => {
-  const user     = verifyToken(req)
   const sql      = db()
+  const user     = await exigirAcesso(req, sql)
   const { conta_id, data } = req.query
 
   if (!conta_id) throw new Error('conta_id obrigatório')
@@ -270,8 +308,8 @@ app.get('/api/operacoes', wrap(async (req, res) => {
 }))
 
 app.post('/api/operacoes', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   const body = req.body || {}
 
   if (body.action === 'salvar') {
@@ -355,8 +393,8 @@ async function ensureOperarSchema(sql) {
 }
 
 app.get('/api/operar', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   await ensureOperarSchema(sql)
   const { action, conta_id } = req.query
   const contaId = parseInt(conta_id)
@@ -450,8 +488,8 @@ app.get('/api/operar', wrap(async (req, res) => {
 }))
 
 app.post('/api/operar', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   await ensureOperarSchema(sql)
   const body = req.body || {}
 
@@ -530,8 +568,8 @@ async function migrateOperacoes(sql) {
 
 // ── /api/performance ───────────────────────────────────────────────────────
 app.get('/api/performance', wrap(async (req, res) => {
-  const user = verifyToken(req)
   const sql  = db()
+  const user = await exigirAcesso(req, sql)
   await migrateOperacoes(sql)
 
   const contas = await sql`SELECT id, nome, plataforma, instrumento FROM contas WHERE usuario_id=${user.id} AND ativa=1 ORDER BY nome`
@@ -633,8 +671,9 @@ app.get('/api/admin', wrap(async (req, res) => {
   const user = verifyToken(req)
   if (user.role !== 'admin') throw Object.assign(new Error('Acesso negado'), { status: 403 })
   const sql = db()
+  await ensureAcessoSchema(sql)
   const rows = await sql`
-    SELECT u.id, u.nome, u.email, u.role, u.ativo, u.criado_em,
+    SELECT u.id, u.nome, u.email, u.role, u.ativo, u.criado_em, u.plano, to_char(u.acesso_ate, 'YYYY-MM-DD') AS acesso_ate,
            COUNT(c.id) AS contas
     FROM usuarios u
     LEFT JOIN contas c ON c.usuario_id = u.id
@@ -648,11 +687,15 @@ app.post('/api/admin', wrap(async (req, res) => {
   if (user.role !== 'admin') throw Object.assign(new Error('Acesso negado'), { status: 403 })
   const sql  = db()
   const body = req.body || {}
+  await ensureAcessoSchema(sql)
 
   if (body.action === 'salvar_usuario') {
     const { id, nome, email, senha, role } = body
     if (!nome?.trim() || !email?.trim()) throw new Error('Nome e e-mail obrigatórios')
+    const plano = body.plano || 'sala'
+    const acessoAte = body.acesso_ate || null
     if (id) {
+      await sql`UPDATE usuarios SET plano=${plano}, acesso_ate=COALESCE(${acessoAte}::date, acesso_ate) WHERE id=${id}`
       if (senha?.trim()) {
         const hash = await bcrypt.hash(senha, 10)
         await sql`UPDATE usuarios SET nome=${nome}, email=${email}, role=${role||'user'}, senha_hash=${hash} WHERE id=${id}`
@@ -664,11 +707,21 @@ app.post('/api/admin', wrap(async (req, res) => {
       if (!senha?.trim()) throw new Error('Senha obrigatória para novo usuário')
       const hash = await bcrypt.hash(senha, 10)
       const [row] = await sql`
-        INSERT INTO usuarios (nome, email, senha_hash, role)
-        VALUES (${nome}, ${email}, ${hash}, ${role||'user'}) RETURNING id
+        INSERT INTO usuarios (nome, email, senha_hash, role, plano, acesso_ate)
+        VALUES (${nome}, ${email}, ${hash}, ${role||'user'}, ${plano}, ${acessoAte}) RETURNING id
       `
       return res.json({ ok: true, id: row.id })
     }
+  }
+
+  // soma dias a partir de hoje, ou a partir da data atual se ainda não venceu
+  if (body.action === 'renovar_acesso') {
+    const dias = parseInt(body.dias) || 30
+    await sql`
+      UPDATE usuarios
+      SET acesso_ate = GREATEST(COALESCE(acesso_ate, (now() AT TIME ZONE 'America/Sao_Paulo')::date), (now() AT TIME ZONE 'America/Sao_Paulo')::date) + ${dias}::int
+      WHERE id = ${body.id}`
+    return res.json({ ok: true })
   }
 
   if (body.action === 'toggle_usuario') {
