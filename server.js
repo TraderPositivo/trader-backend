@@ -301,13 +301,15 @@ app.post('/api/operacoes', wrap(async (req, res) => {
     if (!Array.isArray(ops) || !ops.length) throw new Error('Nenhuma operação para importar')
     const [conta] = await sql`SELECT id FROM contas WHERE id = ${conta_id} AND usuario_id = ${user.id}`
     if (!conta) throw new Error('Conta não encontrada')
+    await migrateOperacoes(sql)
     let inserted = 0
     for (const op of ops) {
       try {
         await sql`
-          INSERT INTO operacoes (conta_id, data_operacao, tipo, horario_entrada, horario_saida, pontos, resultado, custo)
+          INSERT INTO operacoes (conta_id, data_operacao, tipo, horario_entrada, horario_saida, pontos, resultado, custo, observacao, contratos, instrumento)
           VALUES (${conta_id}, ${op.data_operacao}, ${op.tipo}, ${op.horario_entrada}, ${op.horario_saida || null},
-                  ${op.pontos || 0}, ${op.resultado || 0}, ${op.custo || 0})
+                  ${op.pontos || 0}, ${op.resultado || 0}, ${op.custo || 0}, ${op.observacao || null},
+                  ${op.contratos || 1}, ${op.instrumento || 'WIN'})
           ON CONFLICT DO NOTHING
         `
         inserted++
@@ -348,7 +350,7 @@ async function ensureOperarSchema(sql) {
     "ALTER TABLE contas ADD COLUMN IF NOT EXISTS janela_inicio TIME DEFAULT '09:00'",
     "ALTER TABLE contas ADD COLUMN IF NOT EXISTS janela_fim TIME DEFAULT '11:30'",
   ]) {
-    await sql.unsafe(col)
+    try { await sql([col]) } catch(_) {}
   }
 }
 
@@ -520,25 +522,56 @@ app.post('/api/operar', wrap(async (req, res) => {
   throw Object.assign(new Error('Ação não reconhecida'), { status: 400 })
 }))
 
+// ── migrate: contratos column in operacoes ─────────────────────────────────
+async function migrateOperacoes(sql) {
+  try { await sql([`ALTER TABLE operacoes ADD COLUMN IF NOT EXISTS contratos SMALLINT DEFAULT 1`]) } catch(_) {}
+  try { await sql([`ALTER TABLE operacoes ADD COLUMN IF NOT EXISTS instrumento VARCHAR(5) DEFAULT 'WIN'`]) } catch(_) {}
+}
+
 // ── /api/performance ───────────────────────────────────────────────────────
 app.get('/api/performance', wrap(async (req, res) => {
   const user = verifyToken(req)
   const sql  = db()
+  await migrateOperacoes(sql)
 
-  const contas = await sql`SELECT id, nome, plataforma FROM contas WHERE usuario_id=${user.id} AND ativa=1 ORDER BY nome`
+  const contas = await sql`SELECT id, nome, plataforma, instrumento FROM contas WHERE usuario_id=${user.id} AND ativa=1 ORDER BY nome`
   if (!contas.length) return res.json({ contas: [], dados: null })
 
-  const contaId = req.query.conta_id ? parseInt(req.query.conta_id) : contas[0].id
-  const mes     = req.query.mes || new Date().toISOString().slice(0, 7)
-  const inicio  = mes + '-01'
-  const fim     = new Date(mes.split('-')[0], parseInt(mes.split('-')[1]), 0).toISOString().slice(0, 10)
+  // Suporte a range de datas (de/ate) ou mês simples
+  const mes    = req.query.mes || new Date().toISOString().slice(0, 7)
+  const inicio = req.query.de  || mes + '-01'
+  const fim    = req.query.ate || new Date(mes.split('-')[0], parseInt(mes.split('-')[1]), 0).toISOString().slice(0, 10)
 
-  const ops = await sql`
-    SELECT id, data_operacao, tipo, horario_entrada, horario_saida, pontos, resultado, custo, observacao
-    FROM operacoes WHERE conta_id=${contaId} AND data_operacao BETWEEN ${inicio} AND ${fim}
-    ORDER BY data_operacao, horario_entrada
-  `
-  if (!ops.length) return res.json({ contas, dados: null, conta_id: contaId, mes })
+  // Suporte a "todas" as contas
+  const todasContas = req.query.conta_id === 'todas'
+  const contaId = todasContas ? null : (req.query.conta_id ? parseInt(req.query.conta_id) : contas[0].id)
+
+  let ops
+  if (todasContas) {
+    ops = await sql`
+      SELECT o.id, o.data_operacao, o.tipo, o.horario_entrada, o.horario_saida,
+             o.pontos, o.resultado, o.custo, o.observacao,
+             COALESCE(o.contratos, 1) AS contratos,
+             COALESCE(o.instrumento, c.instrumento, 'WIN') AS instrumento,
+             c.nome AS conta_nome
+      FROM operacoes o JOIN contas c ON c.id = o.conta_id
+      WHERE c.usuario_id=${user.id} AND c.ativa=1 AND o.data_operacao BETWEEN ${inicio} AND ${fim}
+      ORDER BY o.data_operacao, o.horario_entrada
+    `
+  } else {
+    ops = await sql`
+      SELECT o.id, o.data_operacao, o.tipo, o.horario_entrada, o.horario_saida,
+             o.pontos, o.resultado, o.custo, o.observacao,
+             COALESCE(o.contratos, 1) AS contratos,
+             COALESCE(o.instrumento, c.instrumento, 'WIN') AS instrumento,
+             c.nome AS conta_nome
+      FROM operacoes o JOIN contas c ON c.id = o.conta_id
+      WHERE o.conta_id=${contaId} AND c.usuario_id=${user.id} AND o.data_operacao BETWEEN ${inicio} AND ${fim}
+      ORDER BY o.data_operacao, o.horario_entrada
+    `
+  }
+
+  if (!ops.length) return res.json({ contas, dados: null, conta_id: todasContas ? 'todas' : contaId, mes, de: inicio, ate: fim })
 
   const lucroTotal = ops.reduce((s, o) => s + parseFloat(o.resultado), 0)
   const custoTotal = ops.reduce((s, o) => s + parseFloat(o.custo || 0), 0)
@@ -575,7 +608,7 @@ app.get('/api/performance', wrap(async (req, res) => {
   const ultimas30 = [...ops].reverse().slice(0, 30).map(o => parseFloat(o.resultado) > 0 ? 'G' : parseFloat(o.resultado) < 0 ? 'L' : 'N').reverse()
 
   res.json({
-    contas, conta_id: contaId, mes,
+    contas, conta_id: todasContas ? 'todas' : contaId, mes, de: inicio, ate: fim,
     dados: {
       lucro_total: parseFloat(lucroTotal.toFixed(2)), bruto_total: parseFloat((lucroTotal + custoTotal).toFixed(2)),
       custo_total: parseFloat(custoTotal.toFixed(2)), total_ops: ops.length,
@@ -589,6 +622,7 @@ app.get('/api/performance', wrap(async (req, res) => {
         ...o,
         data_operacao: o.data_operacao.toISOString?.().slice(0, 10) || String(o.data_operacao).slice(0, 10),
         resultado: parseFloat(o.resultado), pontos: parseFloat(o.pontos), custo: parseFloat(o.custo || 0),
+        contratos: parseInt(o.contratos) || 1,
       })),
     },
   })
