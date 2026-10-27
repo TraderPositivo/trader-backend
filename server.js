@@ -595,6 +595,57 @@ app.get('/api/performance', wrap(async (req, res) => {
   })
 }))
 
+// ── /api/admin ─────────────────────────────────────────────────────────────
+app.get('/api/admin', wrap(async (req, res) => {
+  const user = verifyToken(req)
+  if (user.role !== 'admin') throw Object.assign(new Error('Acesso negado'), { status: 403 })
+  const sql = db()
+  const rows = await sql`
+    SELECT u.id, u.nome, u.email, u.role, u.ativo, u.criado_em,
+           COUNT(c.id) AS contas
+    FROM usuarios u
+    LEFT JOIN contas c ON c.usuario_id = u.id
+    GROUP BY u.id ORDER BY u.criado_em DESC
+  `
+  res.json(rows)
+}))
+
+app.post('/api/admin', wrap(async (req, res) => {
+  const user = verifyToken(req)
+  if (user.role !== 'admin') throw Object.assign(new Error('Acesso negado'), { status: 403 })
+  const sql  = db()
+  const body = req.body || {}
+
+  if (body.action === 'salvar_usuario') {
+    const { id, nome, email, senha, role } = body
+    if (!nome?.trim() || !email?.trim()) throw new Error('Nome e e-mail obrigatórios')
+    if (id) {
+      if (senha?.trim()) {
+        const hash = await bcrypt.hash(senha, 10)
+        await sql`UPDATE usuarios SET nome=${nome}, email=${email}, role=${role||'user'}, senha_hash=${hash} WHERE id=${id}`
+      } else {
+        await sql`UPDATE usuarios SET nome=${nome}, email=${email}, role=${role||'user'} WHERE id=${id}`
+      }
+      return res.json({ ok: true })
+    } else {
+      if (!senha?.trim()) throw new Error('Senha obrigatória para novo usuário')
+      const hash = await bcrypt.hash(senha, 10)
+      const [row] = await sql`
+        INSERT INTO usuarios (nome, email, senha_hash, role)
+        VALUES (${nome}, ${email}, ${hash}, ${role||'user'}) RETURNING id
+      `
+      return res.json({ ok: true, id: row.id })
+    }
+  }
+
+  if (body.action === 'toggle_usuario') {
+    await sql`UPDATE usuarios SET ativo=${body.ativo} WHERE id=${body.id}`
+    return res.json({ ok: true })
+  }
+
+  throw new Error('Ação inválida')
+}))
+
 // ── health check ───────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }))
 
