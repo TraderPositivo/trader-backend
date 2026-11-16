@@ -738,6 +738,7 @@ async function ensureFinanceiroSchema(sql) {
     CREATE TABLE IF NOT EXISTS notas_corretagem (
       id            SERIAL PRIMARY KEY,
       usuario_id    INT NOT NULL REFERENCES usuarios(id),
+      conta_id      INT REFERENCES contas(id),
       mes_referencia VARCHAR(7) NOT NULL,
       resultado_bruto DECIMAL(12,2) NOT NULL DEFAULT 0,
       custos        DECIMAL(12,2) NOT NULL DEFAULT 0,
@@ -745,55 +746,126 @@ async function ensureFinanceiroSchema(sql) {
       darf_pago     DECIMAL(12,2) DEFAULT 0,
       data_pagamento DATE,
       observacao    TEXT,
-      criado_em     TIMESTAMPTZ DEFAULT NOW(),
-      UNIQUE(usuario_id, mes_referencia)
+      criado_em     TIMESTAMPTZ DEFAULT NOW()
     )
+  `
+  // migração: adiciona conta_id se a tabela já existia sem ela
+  await sql`ALTER TABLE notas_corretagem ADD COLUMN IF NOT EXISTS conta_id INT REFERENCES contas(id)`
+  // recria constraint única para suportar uma nota por conta por mês
+  // NULLS NOT DISTINCT: duas linhas com conta_id=NULL no mesmo mês contam como duplicata
+  await sql`ALTER TABLE notas_corretagem DROP CONSTRAINT IF EXISTS notas_corretagem_usuario_id_mes_referencia_key`
+  await sql`
+    DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'notas_corretagem_usuario_mes_conta_key'
+      ) THEN
+        ALTER TABLE notas_corretagem
+          ADD CONSTRAINT notas_corretagem_usuario_mes_conta_key
+          UNIQUE NULLS NOT DISTINCT (usuario_id, mes_referencia, conta_id);
+      END IF;
+    END $$
   `
 }
 
-function calcDarfs(notas) {
-  const sorted = [...notas].sort((a, b) => a.mes_referencia.localeCompare(b.mes_referencia))
-  let prejAcum = 0
-  const result = sorted.map(n => {
-    const lucroLiq = parseFloat(n.resultado_bruto) - parseFloat(n.custos)
-    let prejComp = 0, base = 0, irDevido = 0, darf = 0
+function calcDarfs(notas, contas = []) {
+  // Agrupa notas por mês (pode haver uma nota por conta por mês)
+  const contaMap = Object.fromEntries(contas.map(c => [c.id, c.nome]))
+  const byMes = {}
+  notas.forEach(n => {
+    const mes = n.mes_referencia
+    if (!byMes[mes]) byMes[mes] = []
+    byMes[mes].push(n)
+  })
+
+  const meses = Object.keys(byMes).sort()
+  let prejAcum   = 0  // prejuízo acumulado (carry-forward)
+  let darfAcum   = 0  // DARF abaixo de R$10 (IN 1888/2019 — acumula até atingir o mínimo)
+
+  const result = meses.map(mes => {
+    const grupo = byMes[mes]
+    // consolida todas as notas do mês
+    const totRes  = grupo.reduce((s, n) => s + parseFloat(n.resultado_bruto), 0)
+    const totCus  = grupo.reduce((s, n) => s + parseFloat(n.custos), 0)
+    const totIrrf = grupo.reduce((s, n) => s + parseFloat(n.irrf_retido), 0)
+    const totPago = grupo.reduce((s, n) => s + (parseFloat(n.darf_pago) || 0), 0)
+    // usa data_pagamento da primeira nota com pagamento registrado
+    const dataPagamento = grupo.map(n => n.data_pagamento).find(Boolean) || null
+    // representante para id/observação (primeira nota do mês)
+    const repr = grupo[0]
+
+    const lucroLiq = totRes - totCus
+    let prejComp = 0, base = 0, irDevido = 0, darfBruto = 0, darfFinal = 0
+
     if (lucroLiq > 0) {
       prejComp  = Math.min(lucroLiq, prejAcum)
       prejAcum  = Math.max(0, prejAcum - lucroLiq)
       base      = lucroLiq - prejComp
       irDevido  = base * 0.20
-      darf      = Math.max(0, irDevido - parseFloat(n.irrf_retido))
+      darfBruto = Math.max(0, irDevido - totIrrf)
+      darfFinal = darfBruto + darfAcum  // incorpora valor diferido de meses anteriores
     } else {
       prejAcum += Math.abs(lucroLiq)
+      // darfAcum permanece acumulado — só é cobrado em mês lucrativo
     }
-    const pago = parseFloat(n.darf_pago) || 0
+
+    // Regra IN 1888/2019: DARF < R$10 não é recolhido — acumula para o próximo mês lucrativo
+    let darfCalculado = 0
+    if (lucroLiq > 0) {
+      if (darfFinal > 0 && darfFinal < 10.00) {
+        darfAcum = darfFinal   // adia — não paga este mês
+        darfCalculado = 0
+      } else {
+        darfCalculado = darfFinal
+        darfAcum = 0
+      }
+    }
+
+    const pago = totPago
     let status = 'prejuizo'
     if (lucroLiq > 0) {
-      if (darf <= 0.01) status = 'isento'
-      else if (pago >= darf - 0.01) status = 'pago'
-      else status = 'pendente'
+      if (darfFinal > 0 && darfFinal < 10.00) status = 'diferido'      // acumula para o próximo mês
+      else if (darfCalculado <= 0.01)           status = 'isento'       // IR zerado pelo IRRF
+      else if (pago >= darfCalculado - 0.01)    status = 'pago'
+      else                                      status = 'pendente'
     }
+
     // vencimento: último dia útil do mês seguinte
-    const [y, m] = n.mes_referencia.split('-').map(Number)
+    const [y, m] = mes.split('-').map(Number)
     const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1
-    const lastDay = new Date(ny, nm, 0) // day 0 do mês nm+1 (0-indexed) = último dia de nm
+    const lastDay = new Date(ny, nm, 0)
     if (lastDay.getDay() === 0) lastDay.setDate(lastDay.getDate() - 2)
     else if (lastDay.getDay() === 6) lastDay.setDate(lastDay.getDate() - 1)
+
     return {
-      ...n,
-      resultado_bruto:       parseFloat(n.resultado_bruto),
-      custos:                parseFloat(n.custos),
-      irrf_retido:           parseFloat(n.irrf_retido),
-      darf_pago:             pago,
-      data_pagamento:        n.data_pagamento ? String(n.data_pagamento).slice(0,10) : null,
-      lucro_liquido:         parseFloat(lucroLiq.toFixed(2)),
-      prejuizo_compensado:   parseFloat(prejComp.toFixed(2)),
-      base_calculo:          parseFloat(base.toFixed(2)),
-      ir_devido:             parseFloat(irDevido.toFixed(2)),
-      darf_calculado:        parseFloat(darf.toFixed(2)),
-      prejuizo_acumulado:    parseFloat(prejAcum.toFixed(2)),
+      id:                  repr.id,
+      ids:                 grupo.map(n => n.id),
+      usuario_id:          repr.usuario_id,
+      mes_referencia:      mes,
+      // notas individuais do mês com nome da conta
+      notas:               grupo.map(n => ({
+        ...n,
+        conta_nome: n.conta_id ? (contaMap[n.conta_id] || `Conta ${n.conta_id}`) : null,
+        resultado_bruto: parseFloat(n.resultado_bruto),
+        custos:          parseFloat(n.custos),
+        irrf_retido:     parseFloat(n.irrf_retido),
+        darf_pago:       parseFloat(n.darf_pago) || 0,
+        data_pagamento:  n.data_pagamento ? String(n.data_pagamento).slice(0,10) : null,
+      })),
+      resultado_bruto:     parseFloat(totRes.toFixed(2)),
+      custos:              parseFloat(totCus.toFixed(2)),
+      irrf_retido:         parseFloat(totIrrf.toFixed(2)),
+      darf_pago:           parseFloat(pago.toFixed(2)),
+      data_pagamento:      dataPagamento ? String(dataPagamento).slice(0,10) : null,
+      observacao:          grupo.map(n => n.observacao).filter(Boolean).join(' / ') || null,
+      lucro_liquido:       parseFloat(lucroLiq.toFixed(2)),
+      prejuizo_compensado: parseFloat(prejComp.toFixed(2)),
+      base_calculo:        parseFloat(base.toFixed(2)),
+      ir_devido:           parseFloat(irDevido.toFixed(2)),
+      darf_calculado:      parseFloat(darfCalculado.toFixed(2)),
+      darf_acumulado:      parseFloat(darfAcum.toFixed(2)),  // valor diferido para próximo mês
+      prejuizo_acumulado:  parseFloat(prejAcum.toFixed(2)),
       status,
-      vencimento:            lastDay.toISOString().slice(0, 10),
+      vencimento:          lastDay.toISOString().slice(0, 10),
     }
   })
   return result.reverse()
@@ -803,8 +875,11 @@ app.get('/api/financeiro', wrap(async (req, res) => {
   const sql  = db()
   const user = await exigirAcesso(req, sql)
   await ensureFinanceiroSchema(sql)
-  const notas = await sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia`
-  res.json(calcDarfs(notas))
+  const [notas, contas] = await Promise.all([
+    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia, id`,
+    sql`SELECT id, nome FROM contas WHERE usuario_id=${user.id} ORDER BY nome`,
+  ])
+  res.json({ resumo: calcDarfs(notas, contas), contas })
 }))
 
 app.post('/api/financeiro', wrap(async (req, res) => {
@@ -814,11 +889,13 @@ app.post('/api/financeiro', wrap(async (req, res) => {
   const body = req.body || {}
 
   if (body.action === 'salvar') {
-    const { id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao } = body
+    const { id, mes_referencia, conta_id, resultado_bruto, custos, irrf_retido, observacao } = body
     if (!mes_referencia) throw new Error('Mês de referência obrigatório')
+    const cid = conta_id ? parseInt(conta_id) : null
     if (id) {
       await sql`
         UPDATE notas_corretagem SET
+          conta_id=${cid},
           resultado_bruto=${parseFloat(resultado_bruto)||0},
           custos=${parseFloat(custos)||0},
           irrf_retido=${parseFloat(irrf_retido)||0},
@@ -828,9 +905,9 @@ app.post('/api/financeiro', wrap(async (req, res) => {
       return res.json({ ok: true })
     } else {
       const [row] = await sql`
-        INSERT INTO notas_corretagem (usuario_id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao)
-        VALUES (${user.id}, ${mes_referencia}, ${parseFloat(resultado_bruto)||0}, ${parseFloat(custos)||0}, ${parseFloat(irrf_retido)||0}, ${observacao||null})
-        ON CONFLICT (usuario_id, mes_referencia) DO UPDATE SET
+        INSERT INTO notas_corretagem (usuario_id, conta_id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao)
+        VALUES (${user.id}, ${cid}, ${mes_referencia}, ${parseFloat(resultado_bruto)||0}, ${parseFloat(custos)||0}, ${parseFloat(irrf_retido)||0}, ${observacao||null})
+        ON CONFLICT ON CONSTRAINT notas_corretagem_usuario_mes_conta_key DO UPDATE SET
           resultado_bruto=EXCLUDED.resultado_bruto, custos=EXCLUDED.custos,
           irrf_retido=EXCLUDED.irrf_retido, observacao=EXCLUDED.observacao
         RETURNING id
