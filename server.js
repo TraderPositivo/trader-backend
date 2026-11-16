@@ -923,7 +923,7 @@ function parseNotaCorretagem(raw) {
   // Genial: "Ajuste day trade 116,00 C"
   // Clear/XP: "Resultado líquido das operações 1.234,56"
   // padrão para capturar valor com C/D incluindo ☐ (checkbox da Genial): "94,00 ☐D" ou "116,00 C"
-  const resultado_bruto = findFirst([
+  let resultado_bruto = findFirst([
     /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
     /ajuste\s+day\s*trade\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
     /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*[CD]?)/i,
@@ -966,16 +966,28 @@ function parseNotaCorretagem(raw) {
     if (found >= 2) custos = parseFloat(soma.toFixed(2))
   }
 
-  // fallback Genial: derivar resultado_bruto do Total líquido da nota + custos + irrf
-  // ex: total_liq=-97, custos=3, irrf=0 → resultado=-97+3+0=-94 (perda de 94 antes dos custos)
-  //     total_liq=+113.36, custos=1.5, irrf=1.14 → resultado=+116
-  if ((resultado_bruto === null || resultado_bruto === 0) && custos !== null && irrf_retido !== null) {
-    const totalLiq = findFirst([
-      /total\s+l[íi]quido\s+da\s+nota\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
-      /total\s+l[íi]quido\s+da\s+nota\s+([\d.]+,\d{2}\s*[CD]?)/i,
-    ])
-    if (totalLiq !== null) {
-      resultado_bruto = parseFloat((totalLiq + (totalLiq < 0 ? custos : custos) + irrf_retido).toFixed(2))
+  // Derivação via "Total líquido da nota" (autoritativa para o sinal — Genial).
+  // O pdfjs extrai labels antes dos valores; o C/D imediatamente adjacente a "Ajuste day trade"
+  // vem na verdade de "Ajuste de posição = 0,00 C", tornando o sinal da extração direta não-confiável.
+  // "Total líquido da nota" é a última coluna da linha de totais, logo o último par valor+C/D
+  // daquela seção pertence exatamente a ela.
+  // Fórmula: resultado_bruto = total_liq + custos + irrf
+  //   ex.: total_liq=-97, custos=3, irrf=0 → resultado=-94  (loss)
+  //        total_liq=+113.36, custos=1.5, irrf=1.14 → resultado=+116  (profit)
+  const totalLiqIdx = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
+  if (totalLiqIdx >= 0 && custos !== null) {
+    const section = t.slice(totalLiqIdx, totalLiqIdx + 500)
+    // coleta todos os pares (valor, C/D) não-nulos nesta seção
+    const pairs = [...section.matchAll(/(\d[\d.]*,\d{2})\s*[☐☑☒]?\s*([CD])(?![A-Za-z])/ig)]
+      .filter(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')) > 0)
+    if (pairs.length > 0) {
+      // o último par não-nulo corresponde à coluna "Total líquido da nota"
+      const last = pairs[pairs.length - 1]
+      const abs = parseFloat(last[1].replace(/\./g, '').replace(',', '.'))
+      const totalLiqSigned = last[2].toUpperCase() === 'D' ? -abs : abs
+      if (totalLiqSigned !== 0) {
+        resultado_bruto = parseFloat((totalLiqSigned + (custos || 0) + (irrf_retido || 0)).toFixed(2))
+      }
     }
   }
 
@@ -989,9 +1001,9 @@ app.post('/api/financeiro/parse-pdf', wrap(async (req, res) => {
   const { text } = req.body || {}
   if (!text || text.length < 20) throw new Error('Texto do PDF inválido ou muito curto')
   const result = parseNotaCorretagem(text)
-  // trecho de debug: retorna amostra do texto bruto em torno de "ajuste day trade"
-  const idx = text.toLowerCase().indexOf('ajuste day trade')
-  result._dbg = idx >= 0 ? text.slice(Math.max(0, idx - 20), idx + 80) : text.slice(0, 100)
+  const i1 = text.toLowerCase().indexOf('ajuste day trade')
+  const i2 = text.toLowerCase().search(/total\s+l[íi]quido\s+da\s+nota/)
+  result._dbg = `[adj] ${i1 >= 0 ? text.slice(Math.max(0,i1-10), i1+100) : '?'} || [liq] ${i2 >= 0 ? text.slice(Math.max(0,i2-5), i2+120) : '?'}`
   res.json(result)
 }))
 
