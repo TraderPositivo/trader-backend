@@ -873,25 +873,31 @@ function calcDarfs(notas, contas = []) {
 
 // ── parse de nota de corretagem (texto extraído do PDF pelo frontend) ───────
 function parseNotaCorretagem(raw) {
-  const t = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  // normaliza: colapsa espaços múltiplos, mantém quebras de linha
+  const t = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/[ \t]+/g, ' ')
 
-  // helpers
-  function brToFloat(s) {
+  // converte "1.234,56" ou "1.234,56 D/C" para float; D = débito (negativo em resultado)
+  function toFloat(s, applySign = false) {
     if (!s) return null
-    return parseFloat(s.replace(/\./g, '').replace(',', '.'))
+    const str = String(s).trim()
+    const isD  = /\bD\b/.test(str)
+    const isC  = /\bC\b/.test(str)
+    const num  = str.replace(/[^\d.,]/g, '').replace(/\./g, '').replace(',', '.')
+    const v    = parseFloat(num)
+    if (isNaN(v) || v === 0) return 0
+    return (applySign && isD && !isC) ? -v : v
   }
   function findFirst(patterns) {
     for (const re of patterns) {
       const m = t.match(re)
-      if (m) return brToFloat(m[1])
+      if (m) return toFloat(m[1], true)
     }
     return null
   }
 
-  // ── mês de referência ──────────────────────────────────────────────────────
-  // coleta todas as datas dd/mm/yyyy e pega o mês mais frequente
+  // ── mês de referência — pega o mês mais frequente nas datas dd/mm/yyyy ─────
   let mes_referencia = null
-  const dateHits = [...t.matchAll(/\d{2}\/(\d{2})\/(\d{4})/g)]
+  const dateHits = [...t.matchAll(/\b\d{2}\/(\d{2})\/(\d{4})\b/g)]
   if (dateHits.length) {
     const freq = {}
     dateHits.forEach(([, m, y]) => { const k = `${y}-${m}`; freq[k] = (freq[k]||0)+1 })
@@ -899,42 +905,51 @@ function parseNotaCorretagem(raw) {
   }
 
   // ── resultado bruto day trade ──────────────────────────────────────────────
+  // Genial: "Ajuste day trade 116,00 C"
+  // Clear/XP: "Resultado líquido das operações 1.234,56"
   const resultado_bruto = findFirst([
+    /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*C?)/i,
+    /ajuste\s+day\s*trade\s+([\d.]+,\d{2})/i,
     /resultado\s+l[íi]quido\s+das\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
     /resultado\s+das\s+opera[çc][õo]es\s+day.?trade\s+([\d.]+,\d{2})/i,
     /resultado\s+l[íi]quido\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
     /resultado\s+l[íi]quido\s+([\d.]+,\d{2})/i,
+    /valor\s+dos\s+neg[óo]cios\s+([\d.]+,\d{2}\s*[CD]?)/i,
   ])
 
-  // ── IRRF retido (1% na fonte) ──────────────────────────────────────────────
+  // ── IRRF Day Trade retido ──────────────────────────────────────────────────
+  // Genial: "IRRF Day Trade ( Projeção ) 1,14"
+  // Clear: "I.R.R.F s/ operações, day-trade 12,35"
   const irrf_retido = findFirst([
-    /i\.?r\.?r\.?f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
-    /i\.?r\.?p\.?f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /irrf\s+day\s*trade\s*\(?[^)]{0,20}\)?\s+([\d.]+,\d{2})/i,
+    /i\.r\.r\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /i\.r\.p\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
     /irrf\s+day.?trade\s+([\d.]+,\d{2})/i,
-    /i\.r\.r\.f\.\s+([\d.]+,\d{2})/i,
-    /irrf\s+([\d.]+,\d{2})/i,
   ])
 
-  // ── custos (emolumentos + corretagem + liquidação etc., sem IRRF) ──────────
-  // tenta encontrar o total da seção "Corretagem / Despesas"
+  // ── custos (sem IRRF) ──────────────────────────────────────────────────────
+  // Genial: "Total das despesas 1,50 D"
+  // Clear: "Total [de] despesas 35,49"
   let custos = findFirst([
-    /corretagem\s*\/\s*despesas[\s\S]{0,500}?total\s+([\d.]+,\d{2})/i,
+    /total\s+das\s+despesas\s+([\d.]+,\d{2}\s*D?)/i,
+    /total\s+de\s+despesas\s+([\d.]+,\d{2})/i,
+    /corretagem\s*\/\s*despesas[\s\S]{0,600}?total\s+([\d.]+,\d{2})/i,
     /total\s+de\s+custos\s+([\d.]+,\d{2})/i,
     /custos\s+operacionais\s+([\d.]+,\d{2})/i,
+    /despesas\s+totais\s+([\d.]+,\d{2})/i,
   ])
-  // fallback: soma itens individuais conhecidos
+  // fallback Genial: soma taxa registro BM&F + taxas BM&F
   if (custos === null) {
-    const items = ['corretagem', 'emolumentos', 'liquid[aá]', 'registro', '\\bana\\b', 'iss']
+    const itens = ['taxa\\ registro\\ bm', 'taxas\\ bm.?f', 'emolumentos', 'liquid[aá]', 'registro\\ bm', '\\bana\\b', '\\biss\\b', 'corretagem']
     let soma = 0, found = 0
-    items.forEach(pat => {
-      const m = t.match(new RegExp(`${pat}[^\\n]{0,60}?(\\d[\\d.]*,\\d{2})`, 'i'))
-      if (m) { soma += brToFloat(m[1]); found++ }
+    itens.forEach(pat => {
+      const m = t.match(new RegExp(`${pat}[^\\n]{0,80}?(\\d[\\d.]*,\\d{2})`, 'i'))
+      if (m) { const v = toFloat(m[1]); if (v > 0) { soma += v; found++ } }
     })
     if (found >= 2) custos = parseFloat(soma.toFixed(2))
   }
 
-  const confidence = [mes_referencia, resultado_bruto, irrf_retido, custos].filter(x => x !== null).length
-
+  const confidence = [mes_referencia, resultado_bruto, irrf_retido, custos].filter(x => x !== null && x !== 0).length
   return { mes_referencia, resultado_bruto, custos, irrf_retido, confidence }
 }
 
