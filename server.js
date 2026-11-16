@@ -901,21 +901,30 @@ function parseNotaCorretagem(raw) {
   }
 
   // ── data de pregão — campo explícito "Data pregão DD/MM/YYYY" ──────────────
+  // Permite texto arbitrário entre o label e a data (ex: "Data pregão Folha Nr. nota 1  10/11/2026")
   let data_pregao    = null
   let mes_referencia = null
-  const pregaoM = t.match(/data\s+preg[aã]o\s+(\d{2})\/(\d{2})\/(\d{4})/i)
+  const pregaoM = t.match(/data\s+preg[aã]o[^\n]{0,120}?(\d{2})\/(\d{2})\/(\d{4})/i)
   if (pregaoM) {
     const [, d, m, y] = pregaoM
     data_pregao   = `${y}-${m}-${d}`
     mes_referencia = `${y}-${m}`
   }
-  // fallback: mês mais frequente nas datas dd/mm/yyyy
+  // fallback: mês mais frequente, excluindo datas de vencimento de contratos futuros
+  // (WIN Z26, WDO, etc. repetem sua data de vencimento várias vezes e distorcem a frequência)
   if (!mes_referencia) {
-    const dateHits = [...t.matchAll(/\b\d{2}\/(\d{2})\/(\d{4})\b/g)]
-    if (dateHits.length) {
-      const freq = {}
-      dateHits.forEach(([, m, y]) => { const k = `${y}-${m}`; freq[k] = (freq[k]||0)+1 })
-      mes_referencia = Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0]
+    const allDates = [...t.matchAll(/\b(\d{2})\/(\d{2})\/(\d{4})\b/g)]
+    const freq = {}
+    for (const match of allDates) {
+      const pos   = match.index
+      const linha = t.slice(Math.max(0, pos - 80), pos + 10)
+      // ignora datas precedidas por símbolo de contrato futuro (WIN, WDO, IND, DOL, BGI, etc.)
+      if (/\b(WIN|WDO|IND|DOL|BGI|CCM|ISP|DI1|DAP)\b/i.test(linha)) continue
+      const k = `${match[3]}-${match[2]}`
+      freq[k] = (freq[k] || 0) + 1
+    }
+    if (Object.keys(freq).length) {
+      mes_referencia = Object.entries(freq).sort((a, b) => b[1] - a[1])[0][0]
     }
   }
 
