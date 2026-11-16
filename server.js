@@ -966,28 +966,21 @@ function parseNotaCorretagem(raw) {
     if (found >= 2) custos = parseFloat(soma.toFixed(2))
   }
 
-  // Derivação via "Total líquido da nota" (autoritativa para o sinal — Genial).
-  // O pdfjs extrai labels antes dos valores; o C/D imediatamente adjacente a "Ajuste day trade"
-  // vem na verdade de "Ajuste de posição = 0,00 C", tornando o sinal da extração direta não-confiável.
-  // "Total líquido da nota" é a última coluna da linha de totais, logo o último par valor+C/D
-  // daquela seção pertence exatamente a ela.
-  // Fórmula: resultado_bruto = total_liq + custos + irrf
-  //   ex.: total_liq=-97, custos=3, irrf=0 → resultado=-94  (loss)
-  //        total_liq=+113.36, custos=1.5, irrf=1.14 → resultado=+116  (profit)
-  const totalLiqIdx = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
-  if (totalLiqIdx >= 0 && custos !== null) {
-    const section = t.slice(totalLiqIdx, totalLiqIdx + 500)
-    // coleta todos os pares (valor, C/D) não-nulos nesta seção
-    const pairs = [...section.matchAll(/(\d[\d.]*,\d{2})\s*[☐☑☒]?\s*([CD])(?![A-Za-z])/ig)]
-      .filter(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')) > 0)
-    if (pairs.length > 0) {
-      // o último par não-nulo corresponde à coluna "Total líquido da nota"
-      const last = pairs[pairs.length - 1]
-      const abs = parseFloat(last[1].replace(/\./g, '').replace(',', '.'))
-      const totalLiqSigned = last[2].toUpperCase() === 'D' ? -abs : abs
-      if (totalLiqSigned !== 0) {
-        resultado_bruto = parseFloat((totalLiqSigned + (custos || 0) + (irrf_retido || 0)).toFixed(2))
-      }
+  // Correção de sinal para notas Genial: o pdfjs extrai labels antes dos valores,
+  // tornando o C/D adjacente ao número não-confiável (pode ser de outro campo).
+  // Estratégia: se resultado > 0 E (irrf=0 ou irrf não extraído) E a seção
+  // "Total líquido da nota" contiver padrão "D {número}" não-nulo (☐D antes do valor),
+  // inverte o sinal — isso confirma que o dia foi uma perda.
+  // Para dias lucrativos (C), não há "D {não-zero}" nessa seção, então o flip não ocorre.
+  if (resultado_bruto !== null && resultado_bruto > 0 && (irrf_retido === null || irrf_retido === 0)) {
+    const liqIdx = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
+    if (liqIdx >= 0) {
+      const liqSection = t.slice(liqIdx, liqIdx + 400)
+      // busca padrão "D {número}" não-nulo (indica perda: ☐D extraído antes do valor)
+      const dAntes = [...liqSection.matchAll(/\bD\s+(\d[\d.]*,\d{2})\b/ig)]
+        .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
+        .filter(v => v > 0)
+      if (dAntes.length > 0) resultado_bruto = -resultado_bruto
     }
   }
 
