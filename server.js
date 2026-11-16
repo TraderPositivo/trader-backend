@@ -1061,6 +1061,11 @@ app.post('/api/financeiro', wrap(async (req, res) => {
     return res.json({ ok: true })
   }
 
+  if (body.action === 'limpar_tudo') {
+    await sql`DELETE FROM notas_corretagem WHERE usuario_id=${user.id}`
+    return res.json({ ok: true })
+  }
+
   throw new Error('Ação inválida')
 }))
 
