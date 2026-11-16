@@ -871,6 +871,81 @@ function calcDarfs(notas, contas = []) {
   return result.reverse()
 }
 
+// ── parse de nota de corretagem (texto extraído do PDF pelo frontend) ───────
+function parseNotaCorretagem(raw) {
+  const t = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+
+  // helpers
+  function brToFloat(s) {
+    if (!s) return null
+    return parseFloat(s.replace(/\./g, '').replace(',', '.'))
+  }
+  function findFirst(patterns) {
+    for (const re of patterns) {
+      const m = t.match(re)
+      if (m) return brToFloat(m[1])
+    }
+    return null
+  }
+
+  // ── mês de referência ──────────────────────────────────────────────────────
+  // coleta todas as datas dd/mm/yyyy e pega o mês mais frequente
+  let mes_referencia = null
+  const dateHits = [...t.matchAll(/\d{2}\/(\d{2})\/(\d{4})/g)]
+  if (dateHits.length) {
+    const freq = {}
+    dateHits.forEach(([, m, y]) => { const k = `${y}-${m}`; freq[k] = (freq[k]||0)+1 })
+    mes_referencia = Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0]
+  }
+
+  // ── resultado bruto day trade ──────────────────────────────────────────────
+  const resultado_bruto = findFirst([
+    /resultado\s+l[íi]quido\s+das\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
+    /resultado\s+das\s+opera[çc][õo]es\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /resultado\s+l[íi]quido\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
+    /resultado\s+l[íi]quido\s+([\d.]+,\d{2})/i,
+  ])
+
+  // ── IRRF retido (1% na fonte) ──────────────────────────────────────────────
+  const irrf_retido = findFirst([
+    /i\.?r\.?r\.?f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /i\.?r\.?p\.?f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /irrf\s+day.?trade\s+([\d.]+,\d{2})/i,
+    /i\.r\.r\.f\.\s+([\d.]+,\d{2})/i,
+    /irrf\s+([\d.]+,\d{2})/i,
+  ])
+
+  // ── custos (emolumentos + corretagem + liquidação etc., sem IRRF) ──────────
+  // tenta encontrar o total da seção "Corretagem / Despesas"
+  let custos = findFirst([
+    /corretagem\s*\/\s*despesas[\s\S]{0,500}?total\s+([\d.]+,\d{2})/i,
+    /total\s+de\s+custos\s+([\d.]+,\d{2})/i,
+    /custos\s+operacionais\s+([\d.]+,\d{2})/i,
+  ])
+  // fallback: soma itens individuais conhecidos
+  if (custos === null) {
+    const items = ['corretagem', 'emolumentos', 'liquid[aá]', 'registro', '\\bana\\b', 'iss']
+    let soma = 0, found = 0
+    items.forEach(pat => {
+      const m = t.match(new RegExp(`${pat}[^\\n]{0,60}?(\\d[\\d.]*,\\d{2})`, 'i'))
+      if (m) { soma += brToFloat(m[1]); found++ }
+    })
+    if (found >= 2) custos = parseFloat(soma.toFixed(2))
+  }
+
+  const confidence = [mes_referencia, resultado_bruto, irrf_retido, custos].filter(x => x !== null).length
+
+  return { mes_referencia, resultado_bruto, custos, irrf_retido, confidence }
+}
+
+app.post('/api/financeiro/parse-pdf', wrap(async (req, res) => {
+  const sql  = db()
+  await exigirAcesso(req, sql)
+  const { text } = req.body || {}
+  if (!text || text.length < 20) throw new Error('Texto do PDF inválido ou muito curto')
+  res.json(parseNotaCorretagem(text))
+}))
+
 app.get('/api/financeiro', wrap(async (req, res) => {
   const sql  = db()
   const user = await exigirAcesso(req, sql)
