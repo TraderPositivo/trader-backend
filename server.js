@@ -879,10 +879,12 @@ function parseNotaCorretagem(raw) {
   // normaliza: colapsa espaços múltiplos, mantém quebras de linha
   const t = raw.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/[ \t]+/g, ' ')
 
-  // converte "1.234,56" ou "1.234,56 D/C" para float; D = débito (negativo em resultado)
+  // converte "1.234,56" ou "1.234,56 D/C" ou "1.234,56 ☐D" para float
+  // D = débito (negativo em resultado); ☐ é símbolo de checkbox do PDF da Genial
   function toFloat(s, applySign = false) {
     if (!s) return null
-    const str = String(s).trim()
+    // remove caracteres não-ASCII (ex: ☐ U+2610) para análise de sinal
+    const str  = String(s).trim().replace(/[^\x20-\x7E]/g, ' ').replace(/\s+/g, ' ').trim()
     const isD  = /\bD\b/.test(str)
     const isC  = /\bC\b/.test(str)
     const num  = str.replace(/[^\d.,]/g, '').replace(/\./g, '').replace(',', '.')
@@ -920,14 +922,16 @@ function parseNotaCorretagem(raw) {
   // ── resultado bruto day trade ──────────────────────────────────────────────
   // Genial: "Ajuste day trade 116,00 C"
   // Clear/XP: "Resultado líquido das operações 1.234,56"
+  // padrão para capturar valor com C/D incluindo ☐ (checkbox da Genial): "94,00 ☐D" ou "116,00 C"
   const resultado_bruto = findFirst([
+    /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
+    /ajuste\s+day\s*trade\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
     /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*[CD]?)/i,
-    /ajuste\s+day\s*trade\s+([\d.]+,\d{2}\s*[CD]?)/i,
-    /resultado\s+l[íi]quido\s+das\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
-    /resultado\s+das\s+opera[çc][õo]es\s+day.?trade\s+([\d.]+,\d{2})/i,
-    /resultado\s+l[íi]quido\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
-    /resultado\s+l[íi]quido\s+([\d.]+,\d{2})/i,
-    /valor\s+dos\s+neg[óo]cios\s+([\d.]+,\d{2}\s*[CD]?)/i,
+    /resultado\s+l[íi]quido\s+das\s+opera[çc][õo]es\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD]?)/i,
+    /resultado\s+das\s+opera[çc][õo]es\s+day.?trade\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD]?)/i,
+    /resultado\s+l[íi]quido\s+opera[çc][õo]es\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD]?)/i,
+    /resultado\s+l[íi]quido\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD]?)/i,
+    /valor\s+dos\s+neg[óo]cios\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD]?)/i,
   ])
 
   // ── IRRF Day Trade retido ──────────────────────────────────────────────────
@@ -960,6 +964,19 @@ function parseNotaCorretagem(raw) {
       if (m) { const v = toFloat(m[1]); if (v > 0) { soma += v; found++ } }
     })
     if (found >= 2) custos = parseFloat(soma.toFixed(2))
+  }
+
+  // fallback Genial: derivar resultado_bruto do Total líquido da nota + custos + irrf
+  // ex: total_liq=-97, custos=3, irrf=0 → resultado=-97+3+0=-94 (perda de 94 antes dos custos)
+  //     total_liq=+113.36, custos=1.5, irrf=1.14 → resultado=+116
+  if ((resultado_bruto === null || resultado_bruto === 0) && custos !== null && irrf_retido !== null) {
+    const totalLiq = findFirst([
+      /total\s+l[íi]quido\s+da\s+nota\s+([\d.]+,\d{2}\s*[☐☑☒]?\s*[CD])/i,
+      /total\s+l[íi]quido\s+da\s+nota\s+([\d.]+,\d{2}\s*[CD]?)/i,
+    ])
+    if (totalLiq !== null) {
+      resultado_bruto = parseFloat((totalLiq + (totalLiq < 0 ? custos : custos) + irrf_retido).toFixed(2))
+    }
   }
 
   const confidence = [mes_referencia, resultado_bruto, irrf_retido, custos].filter(x => x !== null && x !== 0).length
