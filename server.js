@@ -732,6 +732,131 @@ app.post('/api/admin', wrap(async (req, res) => {
   throw new Error('Ação inválida')
 }))
 
+// ── /api/financeiro ────────────────────────────────────────────────────────
+async function ensureFinanceiroSchema(sql) {
+  await sql`
+    CREATE TABLE IF NOT EXISTS notas_corretagem (
+      id            SERIAL PRIMARY KEY,
+      usuario_id    INT NOT NULL REFERENCES usuarios(id),
+      mes_referencia VARCHAR(7) NOT NULL,
+      resultado_bruto DECIMAL(12,2) NOT NULL DEFAULT 0,
+      custos        DECIMAL(12,2) NOT NULL DEFAULT 0,
+      irrf_retido   DECIMAL(12,2) NOT NULL DEFAULT 0,
+      darf_pago     DECIMAL(12,2) DEFAULT 0,
+      data_pagamento DATE,
+      observacao    TEXT,
+      criado_em     TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(usuario_id, mes_referencia)
+    )
+  `
+}
+
+function calcDarfs(notas) {
+  const sorted = [...notas].sort((a, b) => a.mes_referencia.localeCompare(b.mes_referencia))
+  let prejAcum = 0
+  const result = sorted.map(n => {
+    const lucroLiq = parseFloat(n.resultado_bruto) - parseFloat(n.custos)
+    let prejComp = 0, base = 0, irDevido = 0, darf = 0
+    if (lucroLiq > 0) {
+      prejComp  = Math.min(lucroLiq, prejAcum)
+      prejAcum  = Math.max(0, prejAcum - lucroLiq)
+      base      = lucroLiq - prejComp
+      irDevido  = base * 0.20
+      darf      = Math.max(0, irDevido - parseFloat(n.irrf_retido))
+    } else {
+      prejAcum += Math.abs(lucroLiq)
+    }
+    const pago = parseFloat(n.darf_pago) || 0
+    let status = 'prejuizo'
+    if (lucroLiq > 0) {
+      if (darf <= 0.01) status = 'isento'
+      else if (pago >= darf - 0.01) status = 'pago'
+      else status = 'pendente'
+    }
+    // vencimento: último dia útil do mês seguinte
+    const [y, m] = n.mes_referencia.split('-').map(Number)
+    const ny = m === 12 ? y + 1 : y, nm = m === 12 ? 1 : m + 1
+    const lastDay = new Date(ny, nm, 0) // day 0 do mês nm+1 (0-indexed) = último dia de nm
+    if (lastDay.getDay() === 0) lastDay.setDate(lastDay.getDate() - 2)
+    else if (lastDay.getDay() === 6) lastDay.setDate(lastDay.getDate() - 1)
+    return {
+      ...n,
+      resultado_bruto:       parseFloat(n.resultado_bruto),
+      custos:                parseFloat(n.custos),
+      irrf_retido:           parseFloat(n.irrf_retido),
+      darf_pago:             pago,
+      data_pagamento:        n.data_pagamento ? String(n.data_pagamento).slice(0,10) : null,
+      lucro_liquido:         parseFloat(lucroLiq.toFixed(2)),
+      prejuizo_compensado:   parseFloat(prejComp.toFixed(2)),
+      base_calculo:          parseFloat(base.toFixed(2)),
+      ir_devido:             parseFloat(irDevido.toFixed(2)),
+      darf_calculado:        parseFloat(darf.toFixed(2)),
+      prejuizo_acumulado:    parseFloat(prejAcum.toFixed(2)),
+      status,
+      vencimento:            lastDay.toISOString().slice(0, 10),
+    }
+  })
+  return result.reverse()
+}
+
+app.get('/api/financeiro', wrap(async (req, res) => {
+  const sql  = db()
+  const user = await exigirAcesso(req, sql)
+  await ensureFinanceiroSchema(sql)
+  const notas = await sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia`
+  res.json(calcDarfs(notas))
+}))
+
+app.post('/api/financeiro', wrap(async (req, res) => {
+  const sql  = db()
+  const user = await exigirAcesso(req, sql)
+  await ensureFinanceiroSchema(sql)
+  const body = req.body || {}
+
+  if (body.action === 'salvar') {
+    const { id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao } = body
+    if (!mes_referencia) throw new Error('Mês de referência obrigatório')
+    if (id) {
+      await sql`
+        UPDATE notas_corretagem SET
+          resultado_bruto=${parseFloat(resultado_bruto)||0},
+          custos=${parseFloat(custos)||0},
+          irrf_retido=${parseFloat(irrf_retido)||0},
+          observacao=${observacao||null}
+        WHERE id=${id} AND usuario_id=${user.id}
+      `
+      return res.json({ ok: true })
+    } else {
+      const [row] = await sql`
+        INSERT INTO notas_corretagem (usuario_id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao)
+        VALUES (${user.id}, ${mes_referencia}, ${parseFloat(resultado_bruto)||0}, ${parseFloat(custos)||0}, ${parseFloat(irrf_retido)||0}, ${observacao||null})
+        ON CONFLICT (usuario_id, mes_referencia) DO UPDATE SET
+          resultado_bruto=EXCLUDED.resultado_bruto, custos=EXCLUDED.custos,
+          irrf_retido=EXCLUDED.irrf_retido, observacao=EXCLUDED.observacao
+        RETURNING id
+      `
+      return res.json({ ok: true, id: row.id })
+    }
+  }
+
+  if (body.action === 'marcar_pago') {
+    const { id, darf_pago, data_pagamento } = body
+    await sql`
+      UPDATE notas_corretagem
+      SET darf_pago=${parseFloat(darf_pago)||0}, data_pagamento=${data_pagamento||null}
+      WHERE id=${id} AND usuario_id=${user.id}
+    `
+    return res.json({ ok: true })
+  }
+
+  if (body.action === 'excluir') {
+    await sql`DELETE FROM notas_corretagem WHERE id=${body.id} AND usuario_id=${user.id}`
+    return res.json({ ok: true })
+  }
+
+  throw new Error('Ação inválida')
+}))
+
 // ── health check ───────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }))
 
