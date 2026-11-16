@@ -988,7 +988,11 @@ app.post('/api/financeiro/parse-pdf', wrap(async (req, res) => {
   await exigirAcesso(req, sql)
   const { text } = req.body || {}
   if (!text || text.length < 20) throw new Error('Texto do PDF inválido ou muito curto')
-  res.json(parseNotaCorretagem(text))
+  const result = parseNotaCorretagem(text)
+  // trecho de debug: retorna amostra do texto bruto em torno de "ajuste day trade"
+  const idx = text.toLowerCase().indexOf('ajuste day trade')
+  result._dbg = idx >= 0 ? text.slice(Math.max(0, idx - 20), idx + 80) : text.slice(0, 100)
+  res.json(result)
 }))
 
 app.get('/api/financeiro', wrap(async (req, res) => {
