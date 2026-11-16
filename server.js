@@ -749,19 +749,22 @@ async function ensureFinanceiroSchema(sql) {
       criado_em     TIMESTAMPTZ DEFAULT NOW()
     )
   `
-  // migração: adiciona conta_id se a tabela já existia sem ela
+  // migrações cumulativas
   await sql`ALTER TABLE notas_corretagem ADD COLUMN IF NOT EXISTS conta_id INT REFERENCES contas(id)`
-  // recria constraint única para suportar uma nota por conta por mês
-  // NULLS NOT DISTINCT: duas linhas com conta_id=NULL no mesmo mês contam como duplicata
+  await sql`ALTER TABLE notas_corretagem ADD COLUMN IF NOT EXISTS data_pregao DATE`
+
+  // remove constraint antiga (uma nota por mês por conta) e recria por data de pregão
+  // nova regra: uma nota por dia de pregão por conta (múltiplas notas no mesmo mês são ok)
   await sql`ALTER TABLE notas_corretagem DROP CONSTRAINT IF EXISTS notas_corretagem_usuario_id_mes_referencia_key`
+  await sql`ALTER TABLE notas_corretagem DROP CONSTRAINT IF EXISTS notas_corretagem_usuario_mes_conta_key`
   await sql`
     DO $$ BEGIN
       IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'notas_corretagem_usuario_mes_conta_key'
+        SELECT 1 FROM pg_constraint WHERE conname = 'notas_corretagem_usuario_pregao_conta_key'
       ) THEN
         ALTER TABLE notas_corretagem
-          ADD CONSTRAINT notas_corretagem_usuario_mes_conta_key
-          UNIQUE NULLS NOT DISTINCT (usuario_id, mes_referencia, conta_id);
+          ADD CONSTRAINT notas_corretagem_usuario_pregao_conta_key
+          UNIQUE NULLS NOT DISTINCT (usuario_id, data_pregao, conta_id);
       END IF;
     END $$
   `
@@ -895,13 +898,23 @@ function parseNotaCorretagem(raw) {
     return null
   }
 
-  // ── mês de referência — pega o mês mais frequente nas datas dd/mm/yyyy ─────
+  // ── data de pregão — campo explícito "Data pregão DD/MM/YYYY" ──────────────
+  let data_pregao    = null
   let mes_referencia = null
-  const dateHits = [...t.matchAll(/\b\d{2}\/(\d{2})\/(\d{4})\b/g)]
-  if (dateHits.length) {
-    const freq = {}
-    dateHits.forEach(([, m, y]) => { const k = `${y}-${m}`; freq[k] = (freq[k]||0)+1 })
-    mes_referencia = Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0]
+  const pregaoM = t.match(/data\s+preg[aã]o\s+(\d{2})\/(\d{2})\/(\d{4})/i)
+  if (pregaoM) {
+    const [, d, m, y] = pregaoM
+    data_pregao   = `${y}-${m}-${d}`
+    mes_referencia = `${y}-${m}`
+  }
+  // fallback: mês mais frequente nas datas dd/mm/yyyy
+  if (!mes_referencia) {
+    const dateHits = [...t.matchAll(/\b\d{2}\/(\d{2})\/(\d{4})\b/g)]
+    if (dateHits.length) {
+      const freq = {}
+      dateHits.forEach(([, m, y]) => { const k = `${y}-${m}`; freq[k] = (freq[k]||0)+1 })
+      mes_referencia = Object.entries(freq).sort((a,b) => b[1]-a[1])[0][0]
+    }
   }
 
   // ── resultado bruto day trade ──────────────────────────────────────────────
@@ -950,7 +963,7 @@ function parseNotaCorretagem(raw) {
   }
 
   const confidence = [mes_referencia, resultado_bruto, irrf_retido, custos].filter(x => x !== null && x !== 0).length
-  return { mes_referencia, resultado_bruto, custos, irrf_retido, confidence }
+  return { mes_referencia, data_pregao, resultado_bruto, custos, irrf_retido, confidence }
 }
 
 app.post('/api/financeiro/parse-pdf', wrap(async (req, res) => {
@@ -966,7 +979,7 @@ app.get('/api/financeiro', wrap(async (req, res) => {
   const user = await exigirAcesso(req, sql)
   await ensureFinanceiroSchema(sql)
   const [notas, contas] = await Promise.all([
-    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia, id`,
+    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia, data_pregao NULLS FIRST, id`,
     sql`SELECT id, nome FROM contas WHERE usuario_id=${user.id} ORDER BY nome`,
   ])
   res.json({ resumo: calcDarfs(notas, contas), contas })
@@ -979,13 +992,18 @@ app.post('/api/financeiro', wrap(async (req, res) => {
   const body = req.body || {}
 
   if (body.action === 'salvar') {
-    const { id, mes_referencia, conta_id, resultado_bruto, custos, irrf_retido, observacao } = body
+    const { id, mes_referencia, data_pregao, conta_id, resultado_bruto, custos, irrf_retido, observacao } = body
     if (!mes_referencia) throw new Error('Mês de referência obrigatório')
-    const cid = conta_id ? parseInt(conta_id) : null
+    const cid  = conta_id ? parseInt(conta_id) : null
+    // deriva mes_referencia da data_pregao quando disponível
+    const mes  = data_pregao ? data_pregao.slice(0, 7) : mes_referencia
+    const dpg  = data_pregao || null
     if (id) {
       await sql`
         UPDATE notas_corretagem SET
           conta_id=${cid},
+          mes_referencia=${mes},
+          data_pregao=${dpg},
           resultado_bruto=${parseFloat(resultado_bruto)||0},
           custos=${parseFloat(custos)||0},
           irrf_retido=${parseFloat(irrf_retido)||0},
@@ -995,9 +1013,10 @@ app.post('/api/financeiro', wrap(async (req, res) => {
       return res.json({ ok: true })
     } else {
       const [row] = await sql`
-        INSERT INTO notas_corretagem (usuario_id, conta_id, mes_referencia, resultado_bruto, custos, irrf_retido, observacao)
-        VALUES (${user.id}, ${cid}, ${mes_referencia}, ${parseFloat(resultado_bruto)||0}, ${parseFloat(custos)||0}, ${parseFloat(irrf_retido)||0}, ${observacao||null})
-        ON CONFLICT ON CONSTRAINT notas_corretagem_usuario_mes_conta_key DO UPDATE SET
+        INSERT INTO notas_corretagem (usuario_id, conta_id, mes_referencia, data_pregao, resultado_bruto, custos, irrf_retido, observacao)
+        VALUES (${user.id}, ${cid}, ${mes}, ${dpg}, ${parseFloat(resultado_bruto)||0}, ${parseFloat(custos)||0}, ${parseFloat(irrf_retido)||0}, ${observacao||null})
+        ON CONFLICT ON CONSTRAINT notas_corretagem_usuario_pregao_conta_key DO UPDATE SET
+          mes_referencia=EXCLUDED.mes_referencia,
           resultado_bruto=EXCLUDED.resultado_bruto, custos=EXCLUDED.custos,
           irrf_retido=EXCLUDED.irrf_retido, observacao=EXCLUDED.observacao
         RETURNING id
