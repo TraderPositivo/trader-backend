@@ -921,8 +921,8 @@ function parseNotaCorretagem(raw) {
   // Genial: "Ajuste day trade 116,00 C"
   // Clear/XP: "Resultado líquido das operações 1.234,56"
   const resultado_bruto = findFirst([
-    /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*C?)/i,
-    /ajuste\s+day\s*trade\s+([\d.]+,\d{2})/i,
+    /ajuste\s+day\s+trade\s+([\d.]+,\d{2}\s*[CD]?)/i,
+    /ajuste\s+day\s*trade\s+([\d.]+,\d{2}\s*[CD]?)/i,
     /resultado\s+l[íi]quido\s+das\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
     /resultado\s+das\s+opera[çc][õo]es\s+day.?trade\s+([\d.]+,\d{2})/i,
     /resultado\s+l[íi]quido\s+opera[çc][õo]es\s+([\d.]+,\d{2})/i,
