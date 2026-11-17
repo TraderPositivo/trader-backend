@@ -108,6 +108,25 @@ app.post('/api/auth', wrap(async (req, res) => {
     return res.json({ token, usuario: publico(await lerAcesso(sql, user.id)) })
   }
 
+  if (body.action === 'registrar') {
+    const { nome, email, senha } = body
+    if (!nome?.trim() || !email?.trim() || !senha?.trim()) throw new Error('Nome, e-mail e senha são obrigatórios')
+    if (senha.length < 6) throw new Error('A senha precisa ter pelo menos 6 caracteres')
+    await ensureAcessoSchema(sql)
+    const existe = await sql`SELECT id FROM usuarios WHERE email = ${email.toLowerCase().trim()}`
+    if (existe.length) throw new Error('Já existe uma conta com esse e-mail')
+    const hash = await bcrypt.hash(senha, 10)
+    // 7 dias de trial a partir de hoje (America/São Paulo)
+    const [row] = await sql`
+      INSERT INTO usuarios (nome, email, senha_hash, role, plano, ativo, acesso_ate)
+      VALUES (${nome.trim()}, ${email.toLowerCase().trim()}, ${hash}, 'user', 'trial', 1,
+              ((now() AT TIME ZONE 'America/Sao_Paulo')::date + 7))
+      RETURNING id
+    `
+    const token = signToken({ id: row.id, role: 'user' })
+    return res.json({ token, usuario: publico(await lerAcesso(sql, row.id)) })
+  }
+
   if (body.action === 'me') {
     const decoded = verifyToken(req)
     const u = await lerAcesso(sql, decoded.id)
