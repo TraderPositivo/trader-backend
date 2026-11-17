@@ -1013,46 +1013,53 @@ function parseNotaCorretagem(raw) {
     }
   }
 
-  // Fallback IRRF Genial notas lucrativas — roda APÓS correção de sinal:
-  // após o flip, resultado_bruto > 0 garante que é realmente um dia lucrativo.
-  // Genial coloca C=0,00 adjacente ao label e o valor real fica na coluna D logo depois.
-  // Janela de 60 chars: valor real (~35 chars) está antes da seção de custos (~110+ chars).
+  // ── helper: extrai total_liq da seção "Total líquido da nota" ───────────────
+  function getTotalLiq() {
+    const liqIdx = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
+    if (liqIdx < 0) return null
+    const sec = t.slice(liqIdx, liqIdx + 400)
+    const pares = [...sec.matchAll(/\b([CD])\s+([\d.]+,\d{2})\b/ig)]
+      .map(m => ({ s: m[1].toUpperCase(), v: parseFloat(m[2].replace(/\./g, '').replace(',', '.')) }))
+      .filter(p => p.v > 0)
+    if (!pares.length) return null
+    const ult = pares[pares.length - 1]
+    return ult.s === 'D' ? -ult.v : ult.v
+  }
+
+  // Fallback custos — Genial formato label-first:
+  // seção adj contém "D 1,50" (despesas) nos valores depois dos labels.
+  // Pega o menor "D {valor}" próximo a "ajuste day trade" com valor < 10% do resultado.
+  if ((custos === null || custos === 0) && resultado_bruto !== null) {
+    const adjIdx = t.toLowerCase().indexOf('ajuste day trade')
+    if (adjIdx >= 0) {
+      const adjSec = t.slice(adjIdx, adjIdx + 200)
+      const vals = [...adjSec.matchAll(/\bD\s+([\d.]+,\d{2})\b/ig)]
+        .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
+        .filter(v => v > 0 && v < Math.abs(resultado_bruto) * 0.1)
+      if (vals.length > 0) custos = Math.min(...vals)
+    }
+  }
+
+  // Fallback IRRF — Genial notas lucrativas:
+  // O IRRF não aparece como "D valor" próximo ao label no formato label-first;
+  // deriva pelo cálculo: irrf = resultado_bruto - custos - total_liq
   if ((!irrf_retido || irrf_retido === 0) && resultado_bruto !== null && resultado_bruto > 0) {
-    const irrfIdx = t.toLowerCase().indexOf('irrf day')
-    if (irrfIdx >= 0) {
-      const irrfSec = t.slice(irrfIdx, irrfIdx + 60)
-      const dm = irrfSec.match(/\bD\s+([\d.]+,\d{2})\b/i)
-      if (dm) {
-        const v = parseFloat(dm[1].replace(/\./g, '').replace(',', '.'))
-        if (v > 0 && v < Math.abs(resultado_bruto) * 0.05) irrf_retido = v
-      }
-      if (!irrf_retido || irrf_retido === 0) {
-        const primNaoZero = [...irrfSec.matchAll(/([\d.]+,\d{2})/g)]
-          .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
-          .find(v => v > 0 && v < Math.abs(resultado_bruto) * 0.05)
-        if (primNaoZero) irrf_retido = primNaoZero
+    const tl = getTotalLiq()
+    if (tl !== null) {
+      const der = resultado_bruto - (custos || 0) - tl
+      if (der > 0 && der < Math.abs(resultado_bruto) * 0.05) {
+        irrf_retido = parseFloat(der.toFixed(2))
       }
     }
   }
 
-  // Fallback custos via "Total líquido da nota": custos = resultado_bruto - total_liq - irrf
-  // Mais robusto que extrair itens individuais no formato label-first da Genial
+  // Fallback custos final via total_liq (cobre corretoras sem "D valor" na adj)
   if ((custos === null || custos === 0) && resultado_bruto !== null) {
-    const liqIdx2 = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
-    if (liqIdx2 >= 0) {
-      const liqSec = t.slice(liqIdx2, liqIdx2 + 400)
-      // pega todos os pares "C/D {valor}" não-zero — o último é o total final
-      const pares = [...liqSec.matchAll(/\b([CD])\s+([\d.]+,\d{2})\b/ig)]
-        .map(m => ({ s: m[1].toUpperCase(), v: parseFloat(m[2].replace(/\./g, '').replace(',', '.')) }))
-        .filter(p => p.v > 0)
-      if (pares.length > 0) {
-        const ult = pares[pares.length - 1]
-        const total_liq = ult.s === 'D' ? -ult.v : ult.v
-        const der = resultado_bruto - total_liq - (irrf_retido || 0)
-        // custos devem ser positivos e razoáveis (< 50% do resultado)
-        if (der > 0 && der < Math.abs(resultado_bruto) * 0.5) {
-          custos = parseFloat(der.toFixed(2))
-        }
+    const tl = getTotalLiq()
+    if (tl !== null) {
+      const der = resultado_bruto - tl - (irrf_retido || 0)
+      if (der > 0 && der < Math.abs(resultado_bruto) * 0.5) {
+        custos = parseFloat(der.toFixed(2))
       }
     }
   }
