@@ -964,33 +964,14 @@ function parseNotaCorretagem(raw) {
   // ── IRRF Day Trade retido ──────────────────────────────────────────────────
   // Genial: "IRRF Day Trade ( Projeção ) 0,00 D 1,16" (C=0 adjacente, D=valor real)
   // Clear: "I.R.R.F s/ operações, day-trade 12,35"
+  // IMPORTANTE: o fallback só roda DEPOIS da correção de sinal (mais abaixo),
+  // para não capturar valores espúrios em notas de perda antes do sinal ser corrigido.
   let irrf_retido = findFirst([
     /irrf\s+day\s*trade\s*\(?[^)]{0,20}\)?\s+([\d.]+,\d{2})/i,
     /i\.r\.r\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
     /i\.r\.p\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
     /irrf\s+day.?trade\s+([\d.]+,\d{2})/i,
   ])
-  // Fallback Genial notas lucrativas: regex captura coluna C=0,00 adjacente mas
-  // o valor real está na coluna D logo depois — procura "D {valor}" nos ~200 chars
-  if ((!irrf_retido || irrf_retido === 0) && resultado_bruto !== null && resultado_bruto > 0) {
-    const irrfIdx = t.toLowerCase().indexOf('irrf day')
-    if (irrfIdx >= 0) {
-      const irrfSec = t.slice(irrfIdx, irrfIdx + 200)
-      // primeiro tenta "D {valor}" (IRRF é sempre debitado)
-      const dm = irrfSec.match(/\bD\s+([\d.]+,\d{2})\b/i)
-      if (dm) {
-        const v = parseFloat(dm[1].replace(/\./g, '').replace(',', '.'))
-        if (v > 0 && v < Math.abs(resultado_bruto) * 0.05) irrf_retido = v
-      }
-      // se não achou "D valor", pega qualquer não-zero pequeno (≤5% do resultado)
-      if (!irrf_retido || irrf_retido === 0) {
-        const primNaoZero = [...irrfSec.matchAll(/([\d.]+,\d{2})/g)]
-          .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
-          .find(v => v > 0 && v < Math.abs(resultado_bruto) * 0.05)
-        if (primNaoZero) irrf_retido = primNaoZero
-      }
-    }
-  }
 
   // ── custos (sem IRRF) ──────────────────────────────────────────────────────
   // Genial: "Total das despesas 1,50 D"
@@ -1029,6 +1010,28 @@ function parseNotaCorretagem(raw) {
         .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
         .filter(v => v > 0)
       if (dAntes.length > 0) resultado_bruto = -resultado_bruto
+    }
+  }
+
+  // Fallback IRRF Genial notas lucrativas — roda APÓS correção de sinal:
+  // após o flip, resultado_bruto > 0 garante que é realmente um dia lucrativo.
+  // Genial coloca C=0,00 adjacente ao label e o valor real fica na coluna D logo depois.
+  // Janela de 60 chars: valor real (~35 chars) está antes da seção de custos (~110+ chars).
+  if ((!irrf_retido || irrf_retido === 0) && resultado_bruto !== null && resultado_bruto > 0) {
+    const irrfIdx = t.toLowerCase().indexOf('irrf day')
+    if (irrfIdx >= 0) {
+      const irrfSec = t.slice(irrfIdx, irrfIdx + 60)
+      const dm = irrfSec.match(/\bD\s+([\d.]+,\d{2})\b/i)
+      if (dm) {
+        const v = parseFloat(dm[1].replace(/\./g, '').replace(',', '.'))
+        if (v > 0 && v < Math.abs(resultado_bruto) * 0.05) irrf_retido = v
+      }
+      if (!irrf_retido || irrf_retido === 0) {
+        const primNaoZero = [...irrfSec.matchAll(/([\d.]+,\d{2})/g)]
+          .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
+          .find(v => v > 0 && v < Math.abs(resultado_bruto) * 0.05)
+        if (primNaoZero) irrf_retido = primNaoZero
+      }
     }
   }
 
@@ -1075,7 +1078,7 @@ app.get('/api/financeiro', wrap(async (req, res) => {
   const user = await exigirAcesso(req, sql)
   await ensureFinanceiroSchema(sql)
   const [notas, contas] = await Promise.all([
-    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia ASC, data_pregao ASC NULLS LAST, id ASC`,
+    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia DESC, data_pregao DESC NULLS LAST, id DESC`,
     sql`SELECT id, nome FROM contas WHERE usuario_id=${user.id} ORDER BY nome`,
   ])
   res.json({ resumo: calcDarfs(notas, contas), contas })
