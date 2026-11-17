@@ -317,10 +317,14 @@ app.post('/api/operacoes', wrap(async (req, res) => {
             pontos, resultado, custo, observacao } = body
     const [conta] = await sql`SELECT id FROM contas WHERE id = ${conta_id} AND usuario_id = ${user.id}`
     if (!conta) throw new Error('Conta não encontrada')
+    await migrateOperacoes(sql)
     const [row] = await sql`
       INSERT INTO operacoes (conta_id, data_operacao, tipo, horario_entrada, horario_saida, pontos, resultado, custo, observacao)
       VALUES (${conta_id}, ${data_operacao}, ${tipo}, ${horario_entrada}, ${horario_saida || null},
               ${pontos || 0}, ${resultado || 0}, ${custo || 0}, ${observacao || null})
+      ON CONFLICT ON CONSTRAINT operacoes_conta_data_hora_tipo_key DO UPDATE SET
+        horario_saida=EXCLUDED.horario_saida, pontos=EXCLUDED.pontos,
+        resultado=EXCLUDED.resultado, custo=EXCLUDED.custo, observacao=EXCLUDED.observacao
       RETURNING id
     `
     return res.json({ ok: true, id: row.id })
@@ -564,6 +568,20 @@ app.post('/api/operar', wrap(async (req, res) => {
 async function migrateOperacoes(sql) {
   try { await sql([`ALTER TABLE operacoes ADD COLUMN IF NOT EXISTS contratos SMALLINT DEFAULT 1`]) } catch(_) {}
   try { await sql([`ALTER TABLE operacoes ADD COLUMN IF NOT EXISTS instrumento VARCHAR(5) DEFAULT 'WIN'`]) } catch(_) {}
+  // Constraint que evita duplicatas (mesma conta/dia/hora/tipo = mesma operação)
+  try {
+    await sql([`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'operacoes_conta_data_hora_tipo_key'
+        ) THEN
+          ALTER TABLE operacoes
+            ADD CONSTRAINT operacoes_conta_data_hora_tipo_key
+            UNIQUE (conta_id, data_operacao, horario_entrada, tipo);
+        END IF;
+      END $$
+    `])
+  } catch(_) {}
 }
 
 // ── /api/performance ───────────────────────────────────────────────────────
