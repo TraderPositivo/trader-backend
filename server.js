@@ -962,14 +962,35 @@ function parseNotaCorretagem(raw) {
   ])
 
   // ── IRRF Day Trade retido ──────────────────────────────────────────────────
-  // Genial: "IRRF Day Trade ( Projeção ) 1,14"
+  // Genial: "IRRF Day Trade ( Projeção ) 0,00 D 1,16" (C=0 adjacente, D=valor real)
   // Clear: "I.R.R.F s/ operações, day-trade 12,35"
-  const irrf_retido = findFirst([
+  let irrf_retido = findFirst([
     /irrf\s+day\s*trade\s*\(?[^)]{0,20}\)?\s+([\d.]+,\d{2})/i,
     /i\.r\.r\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
     /i\.r\.p\.f\.?\s+s\/?\s+opera[çc][õo]es,?\s+day.?trade\s+([\d.]+,\d{2})/i,
     /irrf\s+day.?trade\s+([\d.]+,\d{2})/i,
   ])
+  // Fallback Genial notas lucrativas: regex captura coluna C=0,00 adjacente mas
+  // o valor real está na coluna D logo depois — procura "D {valor}" nos ~200 chars
+  if ((!irrf_retido || irrf_retido === 0) && resultado_bruto !== null && resultado_bruto > 0) {
+    const irrfIdx = t.toLowerCase().indexOf('irrf day')
+    if (irrfIdx >= 0) {
+      const irrfSec = t.slice(irrfIdx, irrfIdx + 200)
+      // primeiro tenta "D {valor}" (IRRF é sempre debitado)
+      const dm = irrfSec.match(/\bD\s+([\d.]+,\d{2})\b/i)
+      if (dm) {
+        const v = parseFloat(dm[1].replace(/\./g, '').replace(',', '.'))
+        if (v > 0 && v < Math.abs(resultado_bruto) * 0.05) irrf_retido = v
+      }
+      // se não achou "D valor", pega qualquer não-zero pequeno (≤5% do resultado)
+      if (!irrf_retido || irrf_retido === 0) {
+        const primNaoZero = [...irrfSec.matchAll(/([\d.]+,\d{2})/g)]
+          .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
+          .find(v => v > 0 && v < Math.abs(resultado_bruto) * 0.05)
+        if (primNaoZero) irrf_retido = primNaoZero
+      }
+    }
+  }
 
   // ── custos (sem IRRF) ──────────────────────────────────────────────────────
   // Genial: "Total das despesas 1,50 D"
@@ -1008,6 +1029,28 @@ function parseNotaCorretagem(raw) {
         .map(m => parseFloat(m[1].replace(/\./g, '').replace(',', '.')))
         .filter(v => v > 0)
       if (dAntes.length > 0) resultado_bruto = -resultado_bruto
+    }
+  }
+
+  // Fallback custos via "Total líquido da nota": custos = resultado_bruto - total_liq - irrf
+  // Mais robusto que extrair itens individuais no formato label-first da Genial
+  if ((custos === null || custos === 0) && resultado_bruto !== null) {
+    const liqIdx2 = t.search(/total\s+l[íi]quido\s+da\s+nota/i)
+    if (liqIdx2 >= 0) {
+      const liqSec = t.slice(liqIdx2, liqIdx2 + 400)
+      // pega todos os pares "C/D {valor}" não-zero — o último é o total final
+      const pares = [...liqSec.matchAll(/\b([CD])\s+([\d.]+,\d{2})\b/ig)]
+        .map(m => ({ s: m[1].toUpperCase(), v: parseFloat(m[2].replace(/\./g, '').replace(',', '.')) }))
+        .filter(p => p.v > 0)
+      if (pares.length > 0) {
+        const ult = pares[pares.length - 1]
+        const total_liq = ult.s === 'D' ? -ult.v : ult.v
+        const der = resultado_bruto - total_liq - (irrf_retido || 0)
+        // custos devem ser positivos e razoáveis (< 50% do resultado)
+        if (der > 0 && der < Math.abs(resultado_bruto) * 0.5) {
+          custos = parseFloat(der.toFixed(2))
+        }
+      }
     }
   }
 
