@@ -1075,7 +1075,7 @@ app.get('/api/financeiro', wrap(async (req, res) => {
   const user = await exigirAcesso(req, sql)
   await ensureFinanceiroSchema(sql)
   const [notas, contas] = await Promise.all([
-    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia, data_pregao NULLS FIRST, id`,
+    sql`SELECT * FROM notas_corretagem WHERE usuario_id=${user.id} ORDER BY mes_referencia ASC, data_pregao ASC NULLS LAST, id ASC`,
     sql`SELECT id, nome FROM contas WHERE usuario_id=${user.id} ORDER BY nome`,
   ])
   res.json({ resumo: calcDarfs(notas, contas), contas })
