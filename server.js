@@ -657,6 +657,14 @@ app.get('/api/performance', wrap(async (req, res) => {
   const mediaLoss  = losses.length ? losses.reduce((s, o) => s + parseFloat(o.resultado), 0) / losses.length : 0
   const maxGain    = gains.length  ? Math.max(...gains.map(o => parseFloat(o.resultado))) : 0
   const maxLoss    = losses.length ? Math.min(...losses.map(o => parseFloat(o.resultado))) : 0
+  // métricas normalizadas por contrato
+  const cts = o => parseInt(o.contratos) || 1
+  const mediaGainCts = gains.length  ? gains.reduce((s, o) => s + parseFloat(o.resultado) / cts(o), 0) / gains.length : 0
+  const mediaLossCts = losses.length ? losses.reduce((s, o) => s + parseFloat(o.resultado) / cts(o), 0) / losses.length : 0
+  const pontosTodos  = ops.filter(o => parseFloat(o.pontos) !== 0)
+  const pontosMedia  = pontosTodos.length ? pontosTodos.reduce((s, o) => s + parseFloat(o.pontos) / cts(o), 0) / pontosTodos.length : 0
+  const pontosGain   = gains.length  ? gains.reduce((s, o) => s + parseFloat(o.pontos) / cts(o), 0) / gains.length : 0
+  const pontosLoss   = losses.length ? losses.reduce((s, o) => s + parseFloat(o.pontos) / cts(o), 0) / losses.length : 0
 
   const porDia = {}
   ops.forEach(o => {
@@ -689,6 +697,8 @@ app.get('/api/performance', wrap(async (req, res) => {
       custo_total: parseFloat(custoTotal.toFixed(2)), total_ops: ops.length,
       gains: gains.length, losses: losses.length, win_rate: parseFloat(winRate.toFixed(1)),
       media_gain: parseFloat(mediaGain.toFixed(2)), media_loss: parseFloat(mediaLoss.toFixed(2)),
+      media_gain_cts: parseFloat(mediaGainCts.toFixed(2)), media_loss_cts: parseFloat(mediaLossCts.toFixed(2)),
+      pontos_media: parseFloat(pontosMedia.toFixed(1)), pontos_gain: parseFloat(pontosGain.toFixed(1)), pontos_loss: parseFloat(pontosLoss.toFixed(1)),
       max_gain: parseFloat(maxGain.toFixed(2)), max_loss: parseFloat(maxLoss.toFixed(2)),
       melhor_dia: parseFloat(melhorDia.toFixed(2)), pior_dia: parseFloat(piorDia.toFixed(2)),
       seq_atual: seqAtual, melhor_seq: melhorSeq, pior_seq: piorSeq,
