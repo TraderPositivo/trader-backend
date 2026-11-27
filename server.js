@@ -1,9 +1,9 @@
 import 'node:process'
+import { setDefaultResultOrder } from 'node:dns'
 import { readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
-import { createConnection } from 'node:net'
 import express from 'express'
 import cors from 'cors'
 import postgres from 'postgres'
@@ -27,6 +27,9 @@ const RESEND_KEY   = process.env.RESEND_API_KEY || ''
 const APP_URL      = process.env.APP_URL || 'https://www.gesrisktrader.com.br'
 
 if (!DATABASE_URL) { console.error('DATABASE_URL não configurada'); process.exit(1) }
+
+// Força IPv4 — Render não roteia IPv6 para hosts externos
+setDefaultResultOrder('ipv4first')
 
 // ── helpers ────────────────────────────────────────────────────────────────
 // Parse DATABASE_URL manually so usernames with dots (Supabase pooler format)
@@ -52,15 +55,7 @@ let _pool = null
 function db() {
   if (!_pool) {
     const opts = parseDbUrl(DATABASE_URL)
-    // force IPv4 — Render's network is IPv4-only but DNS returns AAAA records
-    _pool = postgres({
-      ...opts, ssl: 'require', max: 5, idle_timeout: 20,
-      socket: ({ host, port }) => {
-        const h = Array.isArray(host) ? host[0] : host
-        const p = Array.isArray(port) ? port[0] : port
-        return createConnection({ host: h, port: p, family: 4 })
-      },
-    })
+    _pool = postgres({ ...opts, ssl: 'require', max: 5, idle_timeout: 20 })
   }
   return _pool
 }
