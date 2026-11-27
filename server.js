@@ -4,7 +4,7 @@ import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 import cors from 'cors'
-import { neon } from '@neondatabase/serverless'
+import postgres from 'postgres'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
 
@@ -25,7 +25,15 @@ const PORT         = process.env.PORT || 3001
 if (!DATABASE_URL) { console.error('DATABASE_URL não configurada'); process.exit(1) }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-function db() { return neon(DATABASE_URL) }
+// Encode special chars in password (e.g. '#') so URL parsing works
+function encodeDbUrl(url) {
+  return url.replace(/:([^@/]+)@/, (_, pass) => `:${encodeURIComponent(pass)}@`)
+}
+let _pool = null
+function db() {
+  if (!_pool) _pool = postgres(encodeDbUrl(DATABASE_URL), { ssl: 'require', max: 5, idle_timeout: 20 })
+  return _pool
+}
 
 function signToken(payload) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '30d' })
