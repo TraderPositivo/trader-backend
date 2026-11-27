@@ -2,6 +2,7 @@ import 'node:process'
 import { readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomBytes } from 'node:crypto'
 import express from 'express'
 import cors from 'cors'
 import postgres from 'postgres'
@@ -21,17 +22,37 @@ try {
 const DATABASE_URL = process.env.DATABASE_URL
 const JWT_SECRET   = process.env.JWT_SECRET || 'dev-secret-TROQUE'
 const PORT         = process.env.PORT || 3001
+const RESEND_KEY   = process.env.RESEND_API_KEY || ''
+const APP_URL      = process.env.APP_URL || 'https://www.gesrisktrader.com.br'
 
 if (!DATABASE_URL) { console.error('DATABASE_URL não configurada'); process.exit(1) }
 
 // ── helpers ────────────────────────────────────────────────────────────────
-// Encode special chars in password (e.g. '#') so URL parsing works
-function encodeDbUrl(url) {
-  return url.replace(/:([^@/]+)@/, (_, pass) => `:${encodeURIComponent(pass)}@`)
+// Parse DATABASE_URL manually so usernames with dots (Supabase pooler format)
+// and passwords with special chars (#, !, etc.) don't confuse the URL parser.
+function parseDbUrl(rawUrl) {
+  // Remove the scheme, then split on '@' to separate credentials from host
+  const withoutScheme = rawUrl.replace(/^[a-z]+:\/\//, '')
+  const atIdx = withoutScheme.lastIndexOf('@')
+  const credentials = withoutScheme.slice(0, atIdx)
+  const rest        = withoutScheme.slice(atIdx + 1)
+  const colonInCreds = credentials.indexOf(':')
+  const username = decodeURIComponent(credentials.slice(0, colonInCreds))
+  const password = decodeURIComponent(credentials.slice(colonInCreds + 1))
+  const slashIdx = rest.indexOf('/')
+  const hostPort = rest.slice(0, slashIdx)
+  const database = rest.slice(slashIdx + 1).split('?')[0]
+  const colonInHost = hostPort.lastIndexOf(':')
+  const host = hostPort.slice(0, colonInHost)
+  const port = parseInt(hostPort.slice(colonInHost + 1)) || 5432
+  return { host, port, database, username, password }
 }
 let _pool = null
 function db() {
-  if (!_pool) _pool = postgres(encodeDbUrl(DATABASE_URL), { ssl: 'require', max: 5, idle_timeout: 20 })
+  if (!_pool) {
+    const opts = parseDbUrl(DATABASE_URL)
+    _pool = postgres({ ...opts, ssl: 'require', max: 5, idle_timeout: 20 })
+  }
   return _pool
 }
 
@@ -44,6 +65,54 @@ function verifyToken(req) {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : auth
   if (!token) throw Object.assign(new Error('Não autenticado'), { status: 401 })
   return jwt.verify(token, JWT_SECRET)
+}
+
+// ── password reset ────────────────────────────────────────────────────────
+let resetSchemaOk = false
+async function ensureResetSchema(sql) {
+  if (resetSchemaOk) return
+  await sql`
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id         SERIAL PRIMARY KEY,
+      usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+      token      VARCHAR(64) NOT NULL UNIQUE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used       BOOLEAN NOT NULL DEFAULT FALSE
+    )`
+  resetSchemaOk = true
+}
+
+async function enviarEmailReset(email, nome, token) {
+  if (!RESEND_KEY) {
+    console.log('[reset] RESEND_API_KEY ausente — link:', `${APP_URL}/redefinir-senha?token=${token}`)
+    return
+  }
+  const link = `${APP_URL}/redefinir-senha?token=${token}`
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${RESEND_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      from: 'GesRisk Trader <noreply@gesrisktrader.com.br>',
+      to: email,
+      subject: 'Redefinição de senha — GesRisk Trader',
+      html: `
+        <div style="font-family:sans-serif;max-width:500px;margin:0 auto;padding:32px">
+          <h2 style="color:#00c87a;margin:0 0 8px">GesRisk Trader</h2>
+          <p style="color:#444;margin:0 0 24px">Olá, ${nome}!</p>
+          <p style="color:#444">Recebemos uma solicitação para redefinir a senha da sua conta. Clique no botão abaixo para criar uma nova senha:</p>
+          <a href="${link}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:#00c87a;color:#0c0c0e;text-decoration:none;border-radius:8px;font-weight:700;font-size:15px">
+            Redefinir minha senha
+          </a>
+          <p style="color:#888;font-size:13px">O link expira em <strong>1 hora</strong>. Se você não solicitou isso, pode ignorar este e-mail com segurança.</p>
+          <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+          <p style="color:#aaa;font-size:12px">GesRisk Trader · gesrisktrader.com.br</p>
+        </div>`,
+    }),
+  })
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(`Falha ao enviar email: ${body}`)
+  }
 }
 
 // ── acesso por plano ───────────────────────────────────────────────────────
@@ -140,6 +209,40 @@ app.post('/api/auth', wrap(async (req, res) => {
     const u = await lerAcesso(sql, decoded.id)
     if (!u) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 })
     return res.json(publico(u))
+  }
+
+  if (body.action === 'solicitar_reset') {
+    const { email } = body
+    if (!email?.trim()) throw new Error('E-mail obrigatório')
+    await ensureResetSchema(sql)
+    const [u] = await sql`SELECT id, nome, email FROM usuarios WHERE email = ${email.toLowerCase().trim()} AND ativo = 1`
+    // Sempre retorna sucesso para não revelar quais e-mails estão cadastrados
+    if (u) {
+      const token = randomBytes(32).toString('hex')
+      const expires = new Date(Date.now() + 60 * 60 * 1000) // 1 hora
+      await sql`DELETE FROM password_resets WHERE usuario_id = ${u.id}`
+      await sql`INSERT INTO password_resets (usuario_id, token, expires_at) VALUES (${u.id}, ${token}, ${expires})`
+      await enviarEmailReset(u.email, u.nome, token)
+    }
+    return res.json({ ok: true })
+  }
+
+  if (body.action === 'redefinir_senha') {
+    const { token, nova_senha } = body
+    if (!token?.trim()) throw new Error('Token inválido')
+    if (!nova_senha || nova_senha.length < 6) throw new Error('A nova senha precisa ter pelo menos 6 caracteres')
+    await ensureResetSchema(sql)
+    const [row] = await sql`
+      SELECT pr.id, pr.usuario_id, pr.expires_at, pr.used
+      FROM password_resets pr
+      WHERE pr.token = ${token}`
+    if (!row) throw Object.assign(new Error('Link inválido ou expirado'), { status: 400 })
+    if (row.used) throw Object.assign(new Error('Este link já foi utilizado'), { status: 400 })
+    if (new Date(row.expires_at) < new Date()) throw Object.assign(new Error('Link expirado. Solicite um novo.'), { status: 400 })
+    const hash = await bcrypt.hash(nova_senha, 10)
+    await sql`UPDATE usuarios SET senha_hash = ${hash} WHERE id = ${row.usuario_id}`
+    await sql`UPDATE password_resets SET used = TRUE WHERE id = ${row.id}`
+    return res.json({ ok: true })
   }
 
   throw new Error('Ação inválida')
