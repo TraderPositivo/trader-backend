@@ -1295,6 +1295,8 @@ app.post('/api/financeiro', wrap(async (req, res) => {
 }))
 
 // ── health check ───────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true, ts: new Date().toISOString() }))
+const healthHandler = (_, res) => res.json({ ok: true, ts: new Date().toISOString() })
+app.get('/health',      healthHandler)
+app.get('/api/health',  healthHandler)
 
 app.listen(PORT, () => console.log(`Trader Backend rodando na porta ${PORT}`))
