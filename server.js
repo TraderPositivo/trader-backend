@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { randomBytes } from 'node:crypto'
+import { createConnection } from 'node:net'
 import express from 'express'
 import cors from 'cors'
 import postgres from 'postgres'
@@ -51,7 +52,11 @@ let _pool = null
 function db() {
   if (!_pool) {
     const opts = parseDbUrl(DATABASE_URL)
-    _pool = postgres({ ...opts, ssl: 'require', max: 5, idle_timeout: 20 })
+    // force IPv4 — Render's network is IPv4-only but DNS returns AAAA records
+    _pool = postgres({
+      ...opts, ssl: 'require', max: 5, idle_timeout: 20,
+      socket: ({ host, port }) => createConnection({ host, port, family: 4 }),
+    })
   }
   return _pool
 }
