@@ -55,7 +55,11 @@ function db() {
     // force IPv4 — Render's network is IPv4-only but DNS returns AAAA records
     _pool = postgres({
       ...opts, ssl: 'require', max: 5, idle_timeout: 20,
-      socket: ({ host, port }) => createConnection({ host: Array.isArray(host) ? host[0] : host, port, family: 4 }),
+      socket: ({ host, port }) => {
+        const h = Array.isArray(host) ? host[0] : host
+        const p = Array.isArray(port) ? port[0] : port
+        return createConnection({ host: h, port: p, family: 4 })
+      },
     })
   }
   return _pool
