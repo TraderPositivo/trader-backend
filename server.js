@@ -38,7 +38,7 @@ function parseDbUrl(rawUrl) {
   const credentials = withoutScheme.slice(0, atIdx)
   const rest        = withoutScheme.slice(atIdx + 1)
   const colonInCreds = credentials.indexOf(':')
-  const username = decodeURIComponent(credentials.slice(0, colonInCreds))
+  const user     = decodeURIComponent(credentials.slice(0, colonInCreds))
   const password = decodeURIComponent(credentials.slice(colonInCreds + 1))
   const slashIdx = rest.indexOf('/')
   const hostPort = rest.slice(0, slashIdx)
@@ -46,7 +46,7 @@ function parseDbUrl(rawUrl) {
   const colonInHost = hostPort.lastIndexOf(':')
   const host = hostPort.slice(0, colonInHost)
   const port = parseInt(hostPort.slice(colonInHost + 1)) || 5432
-  return { host, port, database, username, password }
+  return { host, port, database, user, password }
 }
 let _pool = null
 function db() {
